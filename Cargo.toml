@@ -8,11 +8,14 @@ members = [
 name = "agsim"
 version = "0.1.0"
 edition = "2024"
+description = "A discrete event simulation library."
+license = "GPL-3.0"
+repository = "https://github.com/jamieyoung5/agsim"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-state_macros = { path = "state_macros" }
+state_macros = { version = "0.1.0", path = "state_macros" }
 rand = "0.8.5"
 rand_distr = "0.4"
 
