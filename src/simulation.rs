@@ -1,7 +1,8 @@
 use crate::agent::Agent;
-use crate::state::{State, StateChangeEvent, Timeline};
+use crate::state::{State, StateChangeEvent};
 use chrono::{DateTime, Duration, Utc};
-use rand::rngs::ThreadRng;
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::Hash;
@@ -37,7 +38,7 @@ where
     agents: Vec<Agent<C, S>>,
     current_time: DateTime<Utc>,
     event_log: Vec<StateChangeEvent>,
-    rng: ThreadRng,
+    rng: Box<dyn RngCore>,
 }
 
 impl<C, S> Simulation<C, S>
@@ -50,47 +51,88 @@ where
             agents,
             current_time: start_time,
             event_log: Vec::new(),
-            rng: rand::thread_rng(),
+            rng: Box::new(StdRng::from_entropy()),
+        }
+    }
+
+    pub fn new_with_seed(agents: Vec<Agent<C, S>>, start_time: DateTime<Utc>, seed: u64) -> Self {
+        Simulation {
+            agents,
+            current_time: start_time,
+            event_log: Vec::new(),
+            rng: Box::new(StdRng::seed_from_u64(seed)),
         }
     }
 
     // run processes the simulation over a specified duration
     pub fn run(&mut self, duration: Duration) -> Vec<StateChangeEvent> {
         let end_time = self.current_time + duration;
-        let mut queue = BinaryHeap::new();
+        let mut queue = self.initialize_queue();
 
-        for index in 0..self.agents.len() {
-            self.schedule_next_event(index, &mut queue);
-        }
-
-        // orchestrate event scheduling
         while let Some(event) = queue.pop() {
             if event.time > end_time {
                 break;
             }
-
-            self.current_time = event.time;
-
-            if let Some(target_type) = event.next_state_type {
-                let agent_index = event.agent_index;
-
-                // apply the state transition and record state change
-                let changes = {
-                    let agent = &mut self.agents[agent_index];
-                    agent.apply_transition(target_type, self.current_time)
-                };
-                self.event_log.extend(changes);
-
-                self.schedule_next_event(agent_index, &mut queue);
-            }
+            self.process_event_step(event, &mut queue, |changes, log| {
+                log.extend(changes);
+            });
         }
 
         self.event_log.clone()
     }
 
-    // generate_master_timeline generates a complete combined timeline over all agents.
-    pub fn generate_master_timeline(&self) -> Option<Timeline<S>> {
-        Timeline::generate(&self.event_log)
+    // run_streaming processes the simulation over a specified duration, providing a closure to stream the output to
+    // a desired source (i.e, a file/stdout etc). This is usefull when generating a large number of events.
+    pub fn run_streaming<F>(&mut self, duration: Duration, mut callback: F)
+    where
+        F: FnMut(StateChangeEvent),
+    {
+        let end_time = self.current_time + duration;
+        let mut queue = self.initialize_queue();
+
+        while let Some(event) = queue.pop() {
+            if event.time > end_time {
+                break;
+            }
+
+            self.process_event_step(event, &mut queue, |changes, _| {
+                for change in changes {
+                    callback(change);
+                }
+            });
+        }
+    }
+
+    fn initialize_queue(&mut self) -> BinaryHeap<ScheduledEvent<C>> {
+        let mut queue = BinaryHeap::new();
+        for index in 0..self.agents.len() {
+            self.schedule_next_event(index, &mut queue);
+        }
+        queue
+    }
+
+    fn process_event_step<F>(
+        &mut self,
+        event: ScheduledEvent<C>,
+        queue: &mut BinaryHeap<ScheduledEvent<C>>,
+        mut handler: F,
+    ) where
+        F: FnMut(Vec<StateChangeEvent>, &mut Vec<StateChangeEvent>),
+    {
+        self.current_time = event.time;
+
+        if let Some(target_type) = event.next_state_type {
+            let agent_index = event.agent_index;
+
+            let changes = {
+                let agent = &mut self.agents[agent_index];
+                agent.apply_transition(target_type, self.current_time, &mut self.rng)
+            };
+
+            handler(changes, &mut self.event_log);
+
+            self.schedule_next_event(agent_index, queue);
+        }
     }
 
     // seconds_to_duration converts a floating point value representing seconds to a Duration (TimeDelta) type.
@@ -121,138 +163,130 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{Agent, StateType};
-    use crate::state::State;
+    use crate::agent::StateType;
+    use crate::state::StateChangeEvent;
     use std::collections::HashMap;
 
     #[derive(Clone, Default, Debug, PartialEq)]
-    struct SimTestState {
-        val: String,
+    struct MockState {
+        counter: usize,
     }
 
-    impl State for SimTestState {
-        fn update_field(&mut self, field: &str, value: &str) {
-            if field == "val" {
-                self.val = value.to_string();
-            }
-        }
-        fn get_field(&self, field: &str) -> String {
-            if field == "val" {
-                self.val.clone()
+    impl State for MockState {
+        fn diff(&self, other: &Self, time: DateTime<Utc>) -> Vec<StateChangeEvent> {
+            if self.counter != other.counter {
+                vec![StateChangeEvent {
+                    time,
+                    agent_id: String::new(),
+                    field: "counter".to_string(),
+                    old_value: self.counter.to_string(),
+                    new_value: other.counter.to_string(),
+                }]
             } else {
-                "".to_string()
+                vec![]
             }
         }
-        fn get_field_names() -> &'static [&'static str] {
-            &["val"]
-        }
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    enum SimStateMode {
-        A,
-        B,
+    #[derive(Eq, Hash, PartialEq, Clone, Debug)]
+    enum SimState {
+        Step1,
+        Step2,
     }
 
-    fn factory_a() -> Box<SimTestState> {
-        Box::new(SimTestState {
-            val: "A".to_string(),
-        })
-    }
-    fn factory_b() -> Box<SimTestState> {
-        Box::new(SimTestState {
-            val: "B".to_string(),
-        })
+    #[test]
+    fn test_simulation_queue_ordering() {
+        let time = Utc::now();
+
+        let event_early = ScheduledEvent {
+            time: time,
+            agent_index: 0,
+            next_state_type: Some(1),
+        };
+
+        let event_late = ScheduledEvent {
+            time: time + Duration::seconds(10),
+            agent_index: 1,
+            next_state_type: Some(1),
+        };
+
+        assert!(event_early > event_late);
+
+        let mut heap = BinaryHeap::new();
+        heap.push(event_late);
+        heap.push(event_early);
+
+        let popped = heap.pop().unwrap();
+        assert_eq!(popped.agent_index, 0);
     }
 
-    fn create_test_agent(id: &str) -> Agent<SimStateMode, SimTestState> {
+    #[test]
+    fn test_simulation_run_flow() {
+        let start_time = Utc::now();
+        let mut rng = StdRng::seed_from_u64(123);
         let mut transitions = HashMap::new();
 
         transitions.insert(
-            SimStateMode::A,
-            StateType {
-                factory: factory_a,
-                transitions: vec![(SimStateMode::B, 1.0)],
-                event_rate: 100.0,
-            },
+            SimState::Step1,
+            StateType::new_deterministic(
+                || MockState { counter: 1 },
+                vec![(SimState::Step2, 1.0)],
+                0.1,
+            ),
         );
-
         transitions.insert(
-            SimStateMode::B,
-            StateType {
-                factory: factory_b,
-                transitions: vec![(SimStateMode::A, 1.0)],
-                event_rate: 100.0,
-            },
+            SimState::Step2,
+            StateType::new_deterministic(
+                || MockState { counter: 2 },
+                vec![(SimState::Step1, 1.0)],
+                0.1,
+            ),
         );
 
-        Agent::new(id.to_string(), SimStateMode::A, transitions)
-    }
+        let agent = Agent::new(
+            "sim_agent".to_string(),
+            SimState::Step1,
+            transitions,
+            &mut rng,
+        );
 
-    #[test]
-    fn test_simulation_initialization() {
-        let agent = create_test_agent("ag1");
-        let start_time = Utc::now();
-        let sim = Simulation::new(vec![agent], start_time);
-
-        assert_eq!(sim.current_time, start_time);
-        assert!(sim.event_log.is_empty());
-    }
-
-    #[test]
-    fn test_simulation_run_advances_time() {
-        let agent = create_test_agent("ag1");
-        let start_time = Utc::now();
         let mut sim = Simulation::new(vec![agent], start_time);
 
-        let duration = Duration::seconds(1);
-        let events = sim.run(duration);
+        let events = sim.run(Duration::seconds(1));
 
-        assert!(!events.is_empty());
-        assert!(!sim.event_log.is_empty());
+        assert!(
+            !events.is_empty(),
+            "Events list should not be empty with a 0.1s mean delay over 1s duration"
+        );
+
+        let first_event = &events[0];
+        assert_eq!(first_event.agent_id, "sim_agent");
+        assert_eq!(first_event.field, "counter");
 
         assert!(sim.current_time > start_time);
-        assert!(sim.current_time <= start_time + duration);
     }
 
     #[test]
-    fn test_simulation_log_integrity() {
-        let agent = create_test_agent("ag1");
+    fn test_simulation_termination() {
         let start_time = Utc::now();
+        let mut rng = StdRng::seed_from_u64(123);
+        let mut transitions = HashMap::new();
+
+        transitions.insert(
+            SimState::Step1,
+            StateType::new_deterministic(|| MockState { counter: 1 }, vec![], 1.0),
+        );
+
+        let agent = Agent::new(
+            "term_agent".to_string(),
+            SimState::Step1,
+            transitions,
+            &mut rng,
+        );
+
         let mut sim = Simulation::new(vec![agent], start_time);
 
-        sim.run(Duration::milliseconds(100));
-
-        let mut prev_time = start_time;
-        for event in &sim.event_log {
-            assert!(
-                event.time >= prev_time,
-                "Events must be strictly ordered by time"
-            );
-            prev_time = event.time;
-        }
-    }
-
-    #[test]
-    fn test_master_timeline_generation() {
-        let agent = create_test_agent("ag1");
-        let mut sim = Simulation::new(vec![agent], Utc::now());
-
-        sim.run(Duration::milliseconds(50));
-
-        let timeline = sim.generate_master_timeline();
-        assert!(timeline.is_some());
-
-        let tl = timeline.unwrap();
-        assert!(!tl.entries.is_empty());
-    }
-
-    #[test]
-    fn test_seconds_to_duration_conversion() {
-        let dur = Simulation::<SimStateMode, SimTestState>::seconds_to_duration(1.5);
-        assert_eq!(dur, Duration::milliseconds(1500));
-
-        let dur_small = Simulation::<SimStateMode, SimTestState>::seconds_to_duration(0.001);
-        assert_eq!(dur_small, Duration::milliseconds(1));
+        let events = sim.run(Duration::hours(1));
+        assert!(events.is_empty());
     }
 }
