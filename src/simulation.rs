@@ -6,6 +6,16 @@ use rand::{RngCore, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+// Perception controls which agents are fed an event emitted by another. SelfOnly (the default) keeps
+// each agent observing only its own changes; Global broadcasts every event to every agent. A
+// proximity-based variant belongs here once agents carry a location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Perception {
+    #[default]
+    SelfOnly,
+    Global,
+}
+
 struct ScheduledEvent<C> {
     time: DateTime<Utc>,
     agent_index: usize,
@@ -34,6 +44,7 @@ pub struct Simulation<A: SimAgent> {
     current_time: DateTime<Utc>,
     event_log: Vec<StateChangeEvent>,
     rng: Box<dyn RngCore>,
+    perception: Perception,
 }
 
 impl<A: SimAgent> Simulation<A> {
@@ -43,6 +54,7 @@ impl<A: SimAgent> Simulation<A> {
             current_time: start_time,
             event_log: Vec::new(),
             rng: Box::new(StdRng::from_entropy()),
+            perception: Perception::default(),
         }
     }
 
@@ -52,7 +64,12 @@ impl<A: SimAgent> Simulation<A> {
             current_time: start_time,
             event_log: Vec::new(),
             rng: Box::new(StdRng::seed_from_u64(seed)),
+            perception: Perception::default(),
         }
+    }
+
+    pub fn set_perception(&mut self, perception: Perception) {
+        self.perception = perception;
     }
 
     pub fn agents(&self) -> &[A] {
@@ -119,16 +136,22 @@ impl<A: SimAgent> Simulation<A> {
         if let Some(target_type) = event.next_state_type {
             let agent_index = event.agent_index;
 
-            let changes = {
-                let agent = &mut self.agents[agent_index];
-                let changes = agent.apply_transition(target_type, self.current_time, &mut self.rng);
-                // feed the agent its own changes; the Markov agent ignores them, memory-backed
-                // agents record them as observations.
-                for change in &changes {
-                    agent.observe(change);
+            let changes =
+                self.agents[agent_index].apply_transition(target_type, self.current_time, &mut self.rng);
+
+            // route each change to the agents that perceive it. The Markov agent ignores what it
+            // observes; memory-backed agents record it. SelfOnly keeps the agent's own changes local.
+            for change in &changes {
+                for observer in 0..self.agents.len() {
+                    let perceives = match self.perception {
+                        Perception::SelfOnly => observer == agent_index,
+                        Perception::Global => true,
+                    };
+                    if perceives {
+                        self.agents[observer].observe(change);
+                    }
                 }
-                changes
-            };
+            }
 
             handler(changes, &mut self.event_log);
 
@@ -348,5 +371,28 @@ mod tests {
         sim.run(Duration::seconds(10));
 
         assert_eq!(sim.agents()[0].observed, vec!["state".to_string()]);
+    }
+
+    #[test]
+    fn test_global_perception() {
+        let start_time = Utc::now();
+        let agents = vec![
+            ObservingAgent {
+                fired: false,
+                observed: Vec::new(),
+            },
+            ObservingAgent {
+                fired: false,
+                observed: Vec::new(),
+            },
+        ];
+
+        let mut sim = Simulation::new(agents, start_time);
+        sim.set_perception(Perception::Global);
+        sim.run(Duration::seconds(10));
+
+        // each agent fires once and both events reach both agents.
+        assert_eq!(sim.agents()[0].observed.len(), 2);
+        assert_eq!(sim.agents()[1].observed.len(), 2);
     }
 }
