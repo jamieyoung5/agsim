@@ -12,12 +12,17 @@ description = "A discrete event simulation library."
 license = "GPL-3.0"
 repository = "https://github.com/jamieyoung5/agsim"
 
+[features]
+llm = ["dep:ureq", "dep:serde_json"]
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 state_macros = { version = "0.2.0", path = "state_macros" }
 rand = "0.8.5"
 rand_distr = "0.4"
+ureq = { version = "2", optional = true, features = ["json"] }
+serde_json = { version = "1", optional = true }
 
 [lib]
 path = "src/lib.rs"
