@@ -1,11 +1,24 @@
-use crate::agent::Agent;
-use crate::state::{State, StateChangeEvent};
+use crate::agent::SimAgent;
+use crate::state::StateChangeEvent;
 use chrono::{DateTime, Duration, Utc};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::hash::Hash;
+
+// Perception controls which agents are fed an event emitted by another. SelfOnly (the default) keeps
+// each agent observing only its own changes; Global broadcasts every event to every agent; Proximity
+// broadcasts to every agent within `radius` of the emitter (agents without a location perceive
+// nothing, and self-observation falls out for free since an agent is distance 0 from itself).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Perception {
+    #[default]
+    SelfOnly,
+    Global,
+    Proximity {
+        radius: f64,
+    },
+}
 
 struct ScheduledEvent<C> {
     time: DateTime<Utc>,
@@ -30,38 +43,41 @@ impl<C> Ord for ScheduledEvent<C> {
     }
 }
 
-pub struct Simulation<C, S>
-where
-    C: Eq + Hash + Clone,
-    S: State,
-{
-    agents: Vec<Agent<C, S>>,
+pub struct Simulation<A: SimAgent> {
+    agents: Vec<A>,
     current_time: DateTime<Utc>,
     event_log: Vec<StateChangeEvent>,
     rng: Box<dyn RngCore>,
+    perception: Perception,
 }
 
-impl<C, S> Simulation<C, S>
-where
-    C: Eq + Hash + Clone + std::fmt::Debug,
-    S: State + Clone + std::fmt::Debug,
-{
-    pub fn new(agents: Vec<Agent<C, S>>, start_time: DateTime<Utc>) -> Self {
+impl<A: SimAgent> Simulation<A> {
+    pub fn new(agents: Vec<A>, start_time: DateTime<Utc>) -> Self {
         Simulation {
             agents,
             current_time: start_time,
             event_log: Vec::new(),
             rng: Box::new(StdRng::from_entropy()),
+            perception: Perception::default(),
         }
     }
 
-    pub fn new_with_seed(agents: Vec<Agent<C, S>>, start_time: DateTime<Utc>, seed: u64) -> Self {
+    pub fn new_with_seed(agents: Vec<A>, start_time: DateTime<Utc>, seed: u64) -> Self {
         Simulation {
             agents,
             current_time: start_time,
             event_log: Vec::new(),
             rng: Box::new(StdRng::seed_from_u64(seed)),
+            perception: Perception::default(),
         }
+    }
+
+    pub fn set_perception(&mut self, perception: Perception) {
+        self.perception = perception;
+    }
+
+    pub fn agents(&self) -> &[A] {
+        &self.agents
     }
 
     // run processes the simulation over a specified duration
@@ -103,7 +119,7 @@ where
         }
     }
 
-    fn initialize_queue(&mut self) -> BinaryHeap<ScheduledEvent<C>> {
+    fn initialize_queue(&mut self) -> BinaryHeap<ScheduledEvent<A::State>> {
         let mut queue = BinaryHeap::new();
         for index in 0..self.agents.len() {
             self.schedule_next_event(index, &mut queue);
@@ -113,8 +129,8 @@ where
 
     fn process_event_step<F>(
         &mut self,
-        event: ScheduledEvent<C>,
-        queue: &mut BinaryHeap<ScheduledEvent<C>>,
+        event: ScheduledEvent<A::State>,
+        queue: &mut BinaryHeap<ScheduledEvent<A::State>>,
         mut handler: F,
     ) where
         F: FnMut(Vec<StateChangeEvent>, &mut Vec<StateChangeEvent>),
@@ -124,10 +140,33 @@ where
         if let Some(target_type) = event.next_state_type {
             let agent_index = event.agent_index;
 
-            let changes = {
-                let agent = &mut self.agents[agent_index];
-                agent.apply_transition(target_type, self.current_time, &mut self.rng)
-            };
+            let changes =
+                self.agents[agent_index].apply_transition(target_type, self.current_time, &mut self.rng);
+
+            // route each change to the agents that perceive it. The Markov agent ignores what it
+            // observes; memory-backed agents record it. SelfOnly keeps the agent's own changes local.
+            for change in &changes {
+                for observer in 0..self.agents.len() {
+                    let perceives = match self.perception {
+                        Perception::SelfOnly => observer == agent_index,
+                        Perception::Global => true,
+                        Perception::Proximity { radius } => {
+                            match (
+                                self.agents[observer].location(),
+                                self.agents[agent_index].location(),
+                            ) {
+                                (Some(observer_pos), Some(emitter_pos)) => {
+                                    observer_pos.distance(&emitter_pos) <= radius
+                                }
+                                _ => false,
+                            }
+                        }
+                    };
+                    if perceives {
+                        self.agents[observer].observe(change);
+                    }
+                }
+            }
 
             handler(changes, &mut self.event_log);
 
@@ -145,26 +184,32 @@ where
     fn schedule_next_event(
         &mut self,
         agent_index: usize,
-        queue: &mut BinaryHeap<ScheduledEvent<C>>,
+        queue: &mut BinaryHeap<ScheduledEvent<A::State>>,
     ) {
-        if let Some(delay_sec) = self.agents[agent_index].peek_next_event_delay(&mut self.rng) {
-            if let Some(next_state) = self.agents[agent_index].step(&mut self.rng) {
-                let event_time = self.current_time + Self::seconds_to_duration(delay_sec);
-                queue.push(ScheduledEvent {
-                    time: event_time,
-                    agent_index,
-                    next_state_type: Some(next_state),
-                });
-            }
-        }
+        let Some(delay_sec) =
+            self.agents[agent_index].peek_next_event_delay(self.current_time, &mut self.rng)
+        else {
+            return;
+        };
+        let Some(next_state) = self.agents[agent_index].step(self.current_time, &mut self.rng)
+        else {
+            return;
+        };
+
+        let event_time = self.current_time + Self::seconds_to_duration(delay_sec);
+        queue.push(ScheduledEvent {
+            time: event_time,
+            agent_index,
+            next_state_type: Some(next_state),
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::StateType;
-    use crate::state::StateChangeEvent;
+    use crate::agent::{Agent, StateType};
+    use crate::state::{State, StateChangeEvent};
     use std::collections::HashMap;
 
     #[derive(Clone, Default, Debug, PartialEq)]
@@ -192,6 +237,68 @@ mod tests {
     enum SimState {
         Step1,
         Step2,
+    }
+
+    // ObservingAgent fires a single transition and records every event fed back through observe,
+    // exercising the observation feed independently of the Markov agent.
+    struct ObservingAgent {
+        fired: bool,
+        observed: Vec<String>,
+        location: Option<crate::space::Position>,
+    }
+
+    impl ObservingAgent {
+        fn new() -> Self {
+            ObservingAgent {
+                fired: false,
+                observed: Vec::new(),
+                location: None,
+            }
+        }
+
+        fn at(position: crate::space::Position) -> Self {
+            ObservingAgent {
+                fired: false,
+                observed: Vec::new(),
+                location: Some(position),
+            }
+        }
+    }
+
+    impl SimAgent for ObservingAgent {
+        type State = ();
+
+        fn peek_next_event_delay(&self, _now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<f64> {
+            if self.fired { None } else { Some(1.0) }
+        }
+
+        fn step(&self, _now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<()> {
+            if self.fired { None } else { Some(()) }
+        }
+
+        fn apply_transition(
+            &mut self,
+            _next: (),
+            time: DateTime<Utc>,
+            _rng: &mut dyn RngCore,
+        ) -> Vec<StateChangeEvent> {
+            self.fired = true;
+            vec![StateChangeEvent {
+                time,
+                agent_id: "obs".to_string(),
+                field: "state".to_string(),
+                old_value: "0".to_string(),
+                new_value: "1".to_string(),
+            }]
+        }
+
+        fn observe(&mut self, event: &StateChangeEvent) {
+            self.observed.push(event.field.clone());
+        }
+
+        fn location(&self) -> Option<crate::space::Position> {
+            self.location
+        }
     }
 
     #[test]
@@ -288,5 +395,49 @@ mod tests {
 
         let events = sim.run(Duration::hours(1));
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_observation_feed() {
+        let start_time = Utc::now();
+        let mut sim = Simulation::new(vec![ObservingAgent::new()], start_time);
+        sim.run(Duration::seconds(10));
+
+        assert_eq!(sim.agents()[0].observed, vec!["state".to_string()]);
+    }
+
+    #[test]
+    fn test_global_perception() {
+        let start_time = Utc::now();
+        let agents = vec![ObservingAgent::new(), ObservingAgent::new()];
+
+        let mut sim = Simulation::new(agents, start_time);
+        sim.set_perception(Perception::Global);
+        sim.run(Duration::seconds(10));
+
+        // each agent fires once and both events reach both agents.
+        assert_eq!(sim.agents()[0].observed.len(), 2);
+        assert_eq!(sim.agents()[1].observed.len(), 2);
+    }
+
+    #[test]
+    fn test_proximity_perception() {
+        use crate::space::Position;
+
+        let start_time = Utc::now();
+        let agents = vec![
+            ObservingAgent::at(Position::new(0.0, 0.0)),
+            ObservingAgent::at(Position::new(1.0, 0.0)), // within radius of agent 0
+            ObservingAgent::at(Position::new(100.0, 0.0)), // far from both
+        ];
+
+        let mut sim = Simulation::new(agents, start_time);
+        sim.set_perception(Perception::Proximity { radius: 5.0 });
+        sim.run(Duration::seconds(10));
+
+        // agents 0 and 1 perceive each other's event plus their own; agent 2 only its own.
+        assert_eq!(sim.agents()[0].observed.len(), 2);
+        assert_eq!(sim.agents()[1].observed.len(), 2);
+        assert_eq!(sim.agents()[2].observed.len(), 1);
     }
 }
