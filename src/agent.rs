@@ -1,7 +1,7 @@
 use crate::state::{State, StateChangeEvent};
 use chrono::{DateTime, Utc};
+use rand::RngCore;
 use rand::seq::SliceRandom;
-use rand::{Rng, RngCore};
 use rand_distr::{Distribution, Exp};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -41,6 +41,23 @@ where
     }
 }
 
+// SimAgent is the interface the Simulation drives. The Markov Agent implements it via its
+// transition matrix; richer agents (e.g. memory/plan driven) can decide their own transitions and
+// consume the events they emit through observe.
+pub trait SimAgent {
+    type State;
+
+    fn peek_next_event_delay(&self, now: DateTime<Utc>, rng: &mut dyn RngCore) -> Option<f64>;
+    fn step(&self, now: DateTime<Utc>, rng: &mut dyn RngCore) -> Option<Self::State>;
+    fn apply_transition(
+        &mut self,
+        next: Self::State,
+        time: DateTime<Utc>,
+        rng: &mut dyn RngCore,
+    ) -> Vec<StateChangeEvent>;
+    fn observe(&mut self, _event: &StateChangeEvent) {}
+}
+
 pub struct Agent<C, S>
 where
     C: Eq + Hash + Clone,
@@ -76,23 +93,23 @@ where
         }
     }
 
-    // step moves to the next state change in the chain
-    pub fn step(&self, rng: &mut impl Rng) -> Option<C> {
-        let current_def = self.transition_matrix.get(&self.current_state_type)?;
-
-        if current_def.transitions.is_empty() {
-            return None;
-        }
-
-        current_def
-            .transitions
-            .choose_weighted(rng, |item| item.1)
-            .ok()
-            .map(|(next_state, _)| next_state.clone())
+    fn get_target_state(&self, state_type: &C, rng: &mut dyn RngCore) -> Option<S> {
+        self.transition_matrix
+            .get(state_type)
+            .map(|def| (def.factory)(rng))
     }
+}
 
-    // peek_next_event_delay calculates the time until the next event using an exponential distribution based on the event rate
-    pub fn peek_next_event_delay(&self, rng: &mut impl Rng) -> Option<f64> {
+impl<C, S> SimAgent for Agent<C, S>
+where
+    C: Eq + Hash + Clone,
+    S: State + Clone,
+{
+    type State = C;
+
+    // peek_next_event_delay draws the time until the next event from an exponential distribution
+    // keyed on the current state's event rate. Time is unused: a Markov agent's timing is memoryless.
+    fn peek_next_event_delay(&self, _now: DateTime<Utc>, rng: &mut dyn RngCore) -> Option<f64> {
         let current_def = self.transition_matrix.get(&self.current_state_type)?;
 
         // lambda = 1 / Mean.
@@ -107,8 +124,22 @@ where
         Some(exp.sample(rng))
     }
 
-    // apply_transition transitions the agent to a new state type
-    pub fn apply_transition(
+    // step picks the next state type by sampling the current state's weighted transitions.
+    fn step(&self, _now: DateTime<Utc>, rng: &mut dyn RngCore) -> Option<C> {
+        let current_def = self.transition_matrix.get(&self.current_state_type)?;
+
+        if current_def.transitions.is_empty() {
+            return None;
+        }
+
+        current_def
+            .transitions
+            .choose_weighted(rng, |item| item.1)
+            .ok()
+            .map(|(next_state, _)| next_state.clone())
+    }
+
+    fn apply_transition(
         &mut self,
         new_type: C,
         time: DateTime<Utc>,
@@ -129,12 +160,6 @@ where
         self.data = target_state;
 
         events
-    }
-
-    fn get_target_state(&self, state_type: &C, rng: &mut dyn RngCore) -> Option<S> {
-        self.transition_matrix
-            .get(state_type)
-            .map(|def| (def.factory)(rng))
     }
 }
 
@@ -211,7 +236,7 @@ mod tests {
 
         let agent = Agent::new("test".to_string(), AgentState::Idle, transitions, &mut rng);
 
-        let next_state = agent.step(&mut rng);
+        let next_state = agent.step(Utc::now(), &mut rng);
         assert_eq!(next_state, Some(AgentState::Active));
     }
 
@@ -237,12 +262,12 @@ mod tests {
             &mut rng,
         );
 
-        let delay = agent.peek_next_event_delay(&mut rng);
+        let delay = agent.peek_next_event_delay(Utc::now(), &mut rng);
         assert!(delay.is_some());
         assert!(delay.unwrap() > 0.0);
 
         agent.current_state_type = AgentState::Active;
-        let delay_none = agent.peek_next_event_delay(&mut rng);
+        let delay_none = agent.peek_next_event_delay(Utc::now(), &mut rng);
         assert!(delay_none.is_none());
     }
 
