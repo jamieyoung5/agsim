@@ -18,17 +18,20 @@ pub trait Mind: Planner + Reflector {
 
 type StateFactory<C, S> = Arc<dyn Fn(&C, &mut dyn RngCore) -> S + Send + Sync>;
 type Interpreter<C> = Arc<dyn Fn(&PlanStep) -> C + Send + Sync>;
+type Locator = Arc<dyn Fn(&PlanStep) -> Option<Position> + Send + Sync>;
 
 pub struct GenerativeAgent<C, S, M> {
     pub id: String,
     identity: String,
     state_factory: StateFactory<C, S>,
     interpret: Interpreter<C>,
+    locate: Option<Locator>,
     mind: M,
     pub data: S,
     pub memory: MemoryStream,
     pub plan: Plan,
-    // location in the world, for proximity-based perception. None unless set by the caller.
+    // location in the world, for proximity-based perception. None unless set via with_locator or
+    // assigned directly. Updated on each transition when a locator is present.
     pub location: Option<Position>,
 }
 
@@ -72,12 +75,30 @@ where
             identity,
             state_factory,
             interpret,
+            locate: None,
             mind,
             data,
             memory: MemoryStream::new(),
             plan,
             location: None,
         }
+    }
+
+    // with_locator attaches a function mapping a plan action to a world position. The agent then
+    // moves to its current action's location on every transition, and is seeded to the opening
+    // action's location now.
+    pub fn with_locator<F>(mut self, locate: F) -> Self
+    where
+        F: Fn(&PlanStep) -> Option<Position> + Send + Sync + 'static,
+    {
+        let locate: Locator = Arc::new(locate);
+        if let Some(start) = self.plan.steps.first().map(|step| step.start)
+            && let Some(action) = self.plan.current_action(start)
+        {
+            self.location = locate(action);
+        }
+        self.locate = Some(locate);
+        self
     }
 
     // extend_horizon appends a follow-on plan once the agent reaches its final action, so a run
@@ -140,6 +161,15 @@ where
             event.agent_id = self.id.clone();
         }
         self.data = target;
+
+        // move to the location of the action just entered, if a locator is set and supplies one.
+        let moved = self.locate.as_ref().and_then(|locate| {
+            self.plan.current_action(time).and_then(|action| locate(action))
+        });
+        if moved.is_some() {
+            self.location = moved;
+        }
+
         self.extend_horizon(time);
         events
     }
@@ -334,6 +364,29 @@ mod tests {
                 .iter()
                 .any(|m| m.kind == MemoryKind::Reflection)
         );
+    }
+
+    #[test]
+    fn test_locator_moves_agent() {
+        use crate::space::Position;
+
+        let start = Utc::now();
+        let agent = build_agent(MockMind { replan: false }, start).with_locator(|step: &PlanStep| {
+            if step.description.starts_with("work") {
+                Some(Position::new(10.0, 0.0))
+            } else {
+                Some(Position::new(0.0, 0.0))
+            }
+        });
+
+        // seeded to the opening "rest" action's location.
+        assert_eq!(agent.location, Some(Position::new(0.0, 0.0)));
+
+        let mut sim = Simulation::new(vec![agent], start);
+        sim.run(Duration::hours(3)); // crosses the 2h rest -> work boundary
+
+        // moved to the "work" location after the transition.
+        assert_eq!(sim.agents()[0].location, Some(Position::new(10.0, 0.0)));
     }
 
     #[test]
