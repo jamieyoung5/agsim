@@ -5,4 +5,5 @@ pub mod llm;
 pub mod memory;
 pub mod planning;
 pub mod simulation;
+pub mod space;
 pub mod state;

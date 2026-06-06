@@ -7,13 +7,17 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 // Perception controls which agents are fed an event emitted by another. SelfOnly (the default) keeps
-// each agent observing only its own changes; Global broadcasts every event to every agent. A
-// proximity-based variant belongs here once agents carry a location.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// each agent observing only its own changes; Global broadcasts every event to every agent; Proximity
+// broadcasts to every agent within `radius` of the emitter (agents without a location perceive
+// nothing, and self-observation falls out for free since an agent is distance 0 from itself).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Perception {
     #[default]
     SelfOnly,
     Global,
+    Proximity {
+        radius: f64,
+    },
 }
 
 struct ScheduledEvent<C> {
@@ -146,6 +150,17 @@ impl<A: SimAgent> Simulation<A> {
                     let perceives = match self.perception {
                         Perception::SelfOnly => observer == agent_index,
                         Perception::Global => true,
+                        Perception::Proximity { radius } => {
+                            match (
+                                self.agents[observer].location(),
+                                self.agents[agent_index].location(),
+                            ) {
+                                (Some(observer_pos), Some(emitter_pos)) => {
+                                    observer_pos.distance(&emitter_pos) <= radius
+                                }
+                                _ => false,
+                            }
+                        }
                     };
                     if perceives {
                         self.agents[observer].observe(change);
@@ -229,6 +244,25 @@ mod tests {
     struct ObservingAgent {
         fired: bool,
         observed: Vec<String>,
+        location: Option<crate::space::Position>,
+    }
+
+    impl ObservingAgent {
+        fn new() -> Self {
+            ObservingAgent {
+                fired: false,
+                observed: Vec::new(),
+                location: None,
+            }
+        }
+
+        fn at(position: crate::space::Position) -> Self {
+            ObservingAgent {
+                fired: false,
+                observed: Vec::new(),
+                location: Some(position),
+            }
+        }
     }
 
     impl SimAgent for ObservingAgent {
@@ -260,6 +294,10 @@ mod tests {
 
         fn observe(&mut self, event: &StateChangeEvent) {
             self.observed.push(event.field.clone());
+        }
+
+        fn location(&self) -> Option<crate::space::Position> {
+            self.location
         }
     }
 
@@ -362,12 +400,7 @@ mod tests {
     #[test]
     fn test_observation_feed() {
         let start_time = Utc::now();
-        let agent = ObservingAgent {
-            fired: false,
-            observed: Vec::new(),
-        };
-
-        let mut sim = Simulation::new(vec![agent], start_time);
+        let mut sim = Simulation::new(vec![ObservingAgent::new()], start_time);
         sim.run(Duration::seconds(10));
 
         assert_eq!(sim.agents()[0].observed, vec!["state".to_string()]);
@@ -376,16 +409,7 @@ mod tests {
     #[test]
     fn test_global_perception() {
         let start_time = Utc::now();
-        let agents = vec![
-            ObservingAgent {
-                fired: false,
-                observed: Vec::new(),
-            },
-            ObservingAgent {
-                fired: false,
-                observed: Vec::new(),
-            },
-        ];
+        let agents = vec![ObservingAgent::new(), ObservingAgent::new()];
 
         let mut sim = Simulation::new(agents, start_time);
         sim.set_perception(Perception::Global);
@@ -394,5 +418,26 @@ mod tests {
         // each agent fires once and both events reach both agents.
         assert_eq!(sim.agents()[0].observed.len(), 2);
         assert_eq!(sim.agents()[1].observed.len(), 2);
+    }
+
+    #[test]
+    fn test_proximity_perception() {
+        use crate::space::Position;
+
+        let start_time = Utc::now();
+        let agents = vec![
+            ObservingAgent::at(Position::new(0.0, 0.0)),
+            ObservingAgent::at(Position::new(1.0, 0.0)), // within radius of agent 0
+            ObservingAgent::at(Position::new(100.0, 0.0)), // far from both
+        ];
+
+        let mut sim = Simulation::new(agents, start_time);
+        sim.set_perception(Perception::Proximity { radius: 5.0 });
+        sim.run(Duration::seconds(10));
+
+        // agents 0 and 1 perceive each other's event plus their own; agent 2 only its own.
+        assert_eq!(sim.agents()[0].observed.len(), 2);
+        assert_eq!(sim.agents()[1].observed.len(), 2);
+        assert_eq!(sim.agents()[2].observed.len(), 1);
     }
 }

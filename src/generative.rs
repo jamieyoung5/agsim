@@ -1,6 +1,7 @@
 use crate::agent::SimAgent;
 use crate::memory::{Memory, MemoryStream, Reflector};
 use crate::planning::{Plan, PlanContext, PlanStep, Planner};
+use crate::space::Position;
 use crate::state::{State, StateChangeEvent};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
@@ -27,6 +28,8 @@ pub struct GenerativeAgent<C, S, M> {
     pub data: S,
     pub memory: MemoryStream,
     pub plan: Plan,
+    // location in the world, for proximity-based perception. None unless set by the caller.
+    pub location: Option<Position>,
 }
 
 impl<C, S, M> GenerativeAgent<C, S, M>
@@ -73,6 +76,7 @@ where
             data,
             memory: MemoryStream::new(),
             plan,
+            location: None,
         }
     }
 
@@ -164,6 +168,10 @@ where
         };
         let observation = Memory::new(description, importance, event.time);
         self.plan.react(&self.mind, &observation, &ctx);
+    }
+
+    fn location(&self) -> Option<Position> {
+        self.location
     }
 }
 

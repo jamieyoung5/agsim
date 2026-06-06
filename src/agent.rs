@@ -1,3 +1,4 @@
+use crate::space::Position;
 use crate::state::{State, StateChangeEvent};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
@@ -56,6 +57,12 @@ pub trait SimAgent {
         rng: &mut dyn RngCore,
     ) -> Vec<StateChangeEvent>;
     fn observe(&mut self, _event: &StateChangeEvent) {}
+
+    // location is the agent's position in the world, used for proximity-based perception. Agents
+    // without a location (the default) perceive nothing under Perception::Proximity.
+    fn location(&self) -> Option<Position> {
+        None
+    }
 }
 
 pub struct Agent<C, S>
