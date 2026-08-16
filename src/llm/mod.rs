@@ -1,24 +1,3 @@
-//! Model-backed [`Mind`] implementations for
-//! [`GenerativeAgent`](crate::generative::GenerativeAgent).
-//!
-//! [`LlmMind`] holds the prompting and parsing that planning and reflection need, and delegates the
-//! actual token generation to a [`Backend`]. Three ship with the crate:
-//!
-//! - [`Anthropic`] — the Claude Messages API, with structured outputs, over blocking HTTP.
-//! - [`OpenAiCompat`] — any server exposing the OpenAI chat-completions shape: Ollama, llama.cpp's
-//!   llama-server, vLLM, LM Studio, or a hosted endpoint.
-//! - [`Candle`] — weights loaded into the simulation process itself with
-//!   [candle](https://github.com/huggingface/candle) (feature `local`).
-//!
-//! The split exists because small models need different handling from frontier ones. A backend that
-//! can constrain its own output says so through [`Backend::enforces_schema`] and gets the schema; one
-//! that can't is sent a worked example of the shape instead, and its reply is parsed leniently —
-//! fenced, prefaced with prose, wrapped in `<think>` tags, or with fields under near-miss names.
-//! Every method degrades gracefully rather than failing the run, since the trait methods can't
-//! surface an error: a bad reply costs an unchanged plan or a default importance score.
-//!
-//! Gated behind the `llm` feature.
-
 pub mod anthropic;
 pub mod openai;
 pub mod parse;

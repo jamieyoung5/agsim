@@ -6,13 +6,14 @@ use std::time::{Duration as StdDuration, Instant};
 // how long a live run sleeps in one go while waiting for the next event
 pub(crate) const STOP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 
-// Clock is the source of wall-clock time for a live run.
+/// Source of wall-clock time for a live run. Implement it to pace against something other than
+/// the system clock.
 pub trait Clock {
     fn now(&self) -> Instant;
     fn sleep(&self, duration: StdDuration);
 }
 
-// SystemClock reads the monotonic clock.
+/// A [`Clock`] backed by the monotonic system clock.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -26,7 +27,7 @@ impl Clock for SystemClock {
     }
 }
 
-// StopSignal ends a live run.
+/// Ends a live run. Clone it into a Ctrl-C handler or control thread.
 #[derive(Debug, Clone, Default)]
 pub struct StopSignal(Arc<AtomicBool>);
 
@@ -44,7 +45,7 @@ impl StopSignal {
     }
 }
 
-// Live configures a real-time run.
+/// Pacing configuration for [`Simulation::run_live`](crate::simulation::Simulation::run_live).
 #[derive(Debug, Clone)]
 pub struct Live {
     speed: f64,
@@ -102,15 +103,16 @@ impl Live {
     }
 }
 
+/// Why a live run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveOutcome {
-    // the stop signal was raised.
+    /// The stop signal was raised.
     Stopped,
-    // the callback asked to break.
+    /// The callback returned [`ControlFlow::Break`](std::ops::ControlFlow::Break).
     Halted,
-    // the configured simulated-time horizon was passed.
+    /// The configured simulated-time horizon was passed.
     HorizonReached,
-    // no agent has anything left to do.
+    /// No agent has anything left to do.
     Drained,
 }
 

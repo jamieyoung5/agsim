@@ -10,8 +10,9 @@ use std::sync::Arc;
 // number of memories retrieved to give the Planner context when reacting to an observation.
 const REACTION_CONTEXT: usize = 10;
 
-// Mind is the cognition behind a GenerativeAgent: it plans, reflects, and rates how poignant an
-// observation is. A real implementation backs these with an LLM; tests supply a deterministic stub.
+/// The cognition behind a [`GenerativeAgent`]: it plans, reflects, and rates how poignant an
+/// observation is. Back it with a model (see [`llm`](crate::llm)) or script it, as
+/// `examples/generative_device.rs` does.
 pub trait Mind: Planner + Reflector {
     fn importance(&self, event: &StateChangeEvent) -> f64;
 }
@@ -30,8 +31,8 @@ pub struct GenerativeAgent<C, S, M> {
     pub data: S,
     pub memory: MemoryStream,
     pub plan: Plan,
-    // location in the world, for proximity-based perception. None unless set via with_locator or
-    // assigned directly. Updated on each transition when a locator is present.
+    /// Position in the world, for proximity-based perception. `None` unless set via
+    /// [`with_locator`](Self::with_locator) or assigned directly.
     pub location: Option<Position>,
 }
 
@@ -63,8 +64,7 @@ where
         };
         let plan = Plan::generate(&mind, &ctx);
 
-        // start in the state of whatever the plan has the agent doing at the opening instant, so the
-        // first emitted event is the first real transition.
+        // opening in the plan's current activity means the first emitted event is a real transition
         let data = match plan.current_action(start) {
             Some(action) => state_factory(&interpret(action), rng),
             None => S::default(),
@@ -84,9 +84,8 @@ where
         }
     }
 
-    // with_locator attaches a function mapping a plan action to a world position. The agent then
-    // moves to its current action's location on every transition, and is seeded to the opening
-    // action's location now.
+    /// Attaches a function mapping a plan step to a world position. The agent then moves to its
+    /// current step's location on every transition.
     pub fn with_locator<F>(mut self, locate: F) -> Self
     where
         F: Fn(&PlanStep) -> Option<Position> + Send + Sync + 'static,
@@ -101,8 +100,8 @@ where
         self
     }
 
-    // extend_horizon appends a follow-on plan once the agent reaches its final action, so a run
-    // never outlasts the agent's plan. It's a no-op until then.
+    // appends a follow-on plan once the agent reaches its final action, so a run never outlasts
+    // the plan. a no-op until then.
     fn extend_horizon(&mut self, now: DateTime<Utc>) {
         let plan_end = match self.plan.current_action(now) {
             Some(action) => action.end(),
@@ -135,14 +134,12 @@ where
 {
     type State = C;
 
-    // the next event is the end of the current plan action.
     fn peek_next_event_delay(&self, now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<f64> {
         let action = self.plan.current_action(now)?;
         let secs = (action.end() - now).num_milliseconds() as f64 / 1000.0;
         (secs > 0.0).then_some(secs)
     }
 
-    // the next state is whatever the plan has the agent doing once the current action ends.
     fn step(&self, now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<C> {
         let action = self.plan.current_action(now)?;
         let next = self.plan.current_action(action.end())?;
@@ -162,7 +159,6 @@ where
         }
         self.data = target;
 
-        // move to the location of the action just entered, if a locator is set and supplies one.
         let moved = self.locate.as_ref().and_then(|locate| {
             self.plan.current_action(time).and_then(|action| locate(action))
         });
@@ -174,8 +170,7 @@ where
         events
     }
 
-    // observe records the change as a memory, reflects if enough has built up, and lets the Mind
-    // decide whether to interrupt the plan.
+    // reflects once enough importance has built up, then lets the Mind interrupt the plan
     fn observe(&mut self, event: &StateChangeEvent) {
         let importance = self.mind.importance(event);
         let description = format!("{}: {} -> {}", event.field, event.old_value, event.new_value);

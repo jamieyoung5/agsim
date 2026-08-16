@@ -9,7 +9,7 @@ use std::collections::BinaryHeap;
 use std::ops::ControlFlow;
 use std::time::{Duration as StdDuration, Instant};
 
-// Perception controls which agents are fed an event emitted by another.
+/// Controls which agents are fed an event emitted by another.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Perception {
     #[default]
@@ -91,7 +91,6 @@ impl<A: SimAgent> Simulation<A> {
         self.current_time
     }
 
-    // run processes the simulation over a specified duration
     pub fn run(&mut self, duration: Duration) -> Vec<StateChangeEvent> {
         let end_time = self.current_time + duration;
         let mut queue = self.initialize_queue();
@@ -108,8 +107,7 @@ impl<A: SimAgent> Simulation<A> {
         self.event_log.clone()
     }
 
-    // run_streaming processes the simulation over a specified duration, while providing a closure to stream the output to
-    // a desired source (i.e, a file/stdout etc).
+    /// Like [`run`](Self::run), but hands each event to `callback` instead of accumulating a log.
     pub fn run_streaming<F>(&mut self, duration: Duration, mut callback: F)
     where
         F: FnMut(StateChangeEvent),
@@ -130,8 +128,7 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    // run_live runs the simulation against the wall clock (instead of a fixed stretch of simulated
-    // time)
+    /// Runs against the wall clock, open-ended, rather than over a fixed stretch of simulated time.
     pub fn run_live<F>(&mut self, live: Live, callback: F) -> LiveOutcome
     where
         F: FnMut(StateChangeEvent) -> ControlFlow<()>,
@@ -186,8 +183,7 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    // wait_for holds until the wall clock reaches the point that the target in simulated time maps
-    // to
+    // holds until the wall clock reaches the point `target` maps to under the run's speed
     fn wait_for<C: Clock + ?Sized>(
         clock: &C,
         live: &Live,
@@ -242,7 +238,6 @@ impl<A: SimAgent> Simulation<A> {
                 &mut self.streams[agent_index],
             );
 
-            // route each change to the agents that perceive it
             for change in &changes {
                 for observer in 0..self.agents.len() {
                     let perceives = match self.perception {
@@ -272,13 +267,11 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    // seconds_to_duration converts a floating point value representing seconds to a Duration (TimeDelta) type.
     fn seconds_to_duration(seconds: f64) -> Duration {
         let millis = (seconds * 1000.0).round() as i64;
         Duration::milliseconds(millis)
     }
 
-    /// schedule_next_for_agent attempts to schedule the next event for an agent, if possible.
     fn schedule_next_event(
         &mut self,
         agent_index: usize,

@@ -11,15 +11,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokenizers::Tokenizer;
 
-// ChatTemplate wraps the prompt the way the model was tuned to expect
+/// Wraps the prompt the way the model was tuned to expect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatTemplate {
-    // Llama 3 and its derivatives
+    /// Llama 3 and its derivatives.
     #[default]
     Llama3,
-    // ChatML: Qwen, Hermes, and most fine-tunes that aren't Llama
+    /// ChatML: Qwen, Hermes, and most fine-tunes that aren't Llama.
     ChatMl,
-    // no template (the system and user text run together, for base models)
+    /// No template; system and user text run together, for base models.
     Plain,
 }
 
@@ -40,7 +40,6 @@ impl ChatTemplate {
         }
     }
 
-    // stop_tokens are the strings that end a turn under this template.
     fn stop_tokens(&self) -> &'static [&'static str] {
         match self {
             ChatTemplate::Llama3 => &["<|eot_id|>", "<|end_of_text|>"],

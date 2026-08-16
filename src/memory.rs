@@ -51,8 +51,8 @@ pub struct Insight {
     pub embedding: Option<Vec<f32>>,
 }
 
-// Reflector is the model-backed half of reflection: it produces the focal questions and the
-// insights synthesized from them. Everything else (triggering, retrieval, storage) lives here.
+/// Produces the focal questions for a reflection and the insights synthesized from them.
+/// Triggering, retrieval, and storage live in [`MemoryStream`].
 pub trait Reflector {
     fn salient_questions(&self, recent: &[&Memory]) -> Vec<String>;
     fn synthesize(&self, question: &str, evidence: &[&Memory]) -> Vec<Insight>;
@@ -115,7 +115,7 @@ impl MemoryStream {
         Self::default()
     }
 
-    // add assigns a stable id and accumulates importance toward the next reflection.
+    /// Assigns a stable id and accumulates importance toward the next reflection.
     pub fn add(&mut self, mut memory: Memory) -> MemoryId {
         let id = self.next_id;
         self.next_id += 1;
@@ -170,9 +170,10 @@ impl MemoryStream {
         refs
     }
 
-    // reflect asks the Reflector for focal questions over recent memories, retrieves evidence for
-    // each, and stores the synthesized insights. Insights are added after all retrieval so they
-    // can't cite each other within a single pass.
+    /// Asks the [`Reflector`] for focal questions over recent memories, retrieves evidence for
+    /// each, and stores the synthesized insights.
+    //
+    // insights are added after all retrieval so they can't cite each other within a single pass
     pub fn reflect<R: Reflector>(&mut self, reflector: &R, now: DateTime<Utc>) -> Vec<MemoryId> {
         let questions = {
             let recent = self.recent(REFLECTION_RECENT_WINDOW);
@@ -200,7 +201,8 @@ impl MemoryStream {
         new_ids
     }
 
-    // retrieve returns the top_k memories by combined score and refreshes their access time.
+    /// Returns the `top_k` memories by combined recency, importance, and relevance score, and
+    /// refreshes their access time.
     pub fn retrieve(
         &mut self,
         query: Option<&[f32]>,
@@ -268,7 +270,6 @@ impl MemoryStream {
     }
 }
 
-// min_max_normalize scales into [0, 1], returning zeros when every value is equal.
 fn min_max_normalize(values: &[f64]) -> Vec<f64> {
     let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);

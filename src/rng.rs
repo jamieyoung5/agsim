@@ -12,8 +12,8 @@ pub fn substream(seed: u64, index: u64) -> StdRng {
     StdRng::seed_from_u64(derive(seed, index))
 }
 
-// derive is substream's seed without the generator, for handing to something that seeds itself —
-// sampling in a local model, for instance.
+/// [`substream`]'s seed without the generator, for handing to something that seeds itself, such as
+/// sampling in a local model.
 pub fn derive(seed: u64, index: u64) -> u64 {
     splitmix64(seed ^ splitmix64(index))
 }

@@ -24,7 +24,7 @@ struct DeviceState {
     cpu_in_use_percent: f32,
 }
 
-// device_state generates plausible metrics for a given operational mode (the C -> S factory).
+// the mode -> state factory: plausible metrics for whatever the plan has the device doing
 fn device_state(mode: &DeviceOperationalMode, rng: &mut dyn RngCore) -> DeviceState {
     match mode {
         DeviceOperationalMode::Offline => DeviceState {
@@ -54,7 +54,7 @@ fn device_state(mode: &DeviceOperationalMode, rng: &mut dyn RngCore) -> DeviceSt
     }
 }
 
-// interpret_mode maps a plan activity to the operational mode the device is in during it.
+// the plan step -> mode reading. a model writes prose, so match loosely on what it wrote
 fn interpret_mode(step: &PlanStep) -> DeviceOperationalMode {
     let activity = step.description.to_lowercase();
     if activity.contains("offline") {
@@ -68,8 +68,8 @@ fn interpret_mode(step: &PlanStep) -> DeviceOperationalMode {
     }
 }
 
-// ScriptedMind is a deterministic stand-in for an LLM... a fixed daily routine, no reactions, and a
-// simple reflection. (it lets the example run with no api key)
+// a deterministic stand-in for an LLM: fixed daily routine, no reactions, trivial reflection.
+// keeps the example runnable with no API key.
 struct ScriptedMind;
 
 impl Planner for ScriptedMind {

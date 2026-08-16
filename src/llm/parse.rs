@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-// extract_json pulls the first complete JSON object or array out of a model's reply.
+/// Pulls the first complete JSON object or array out of a model's reply.
 pub fn extract_json(text: &str) -> Option<Value> {
     let body = strip_reasoning(text);
     let body = strip_fences(body);
@@ -11,8 +11,8 @@ pub fn extract_json(text: &str) -> Option<Value> {
         .or_else(|| serde_json::from_str(&repair(candidate)).ok())
 }
 
-// strip_reasoning drops a leading chain of thought. Reasoning-tuned small models emit it inline,
-// and it is full of braces that would otherwise look like the answer.
+// reasoning-tuned small models emit chain of thought inline, and it is full of braces that would
+// otherwise look like the answer
 fn strip_reasoning(text: &str) -> &str {
     match text.rfind("</think>") {
         Some(end) => &text[end + "</think>".len()..],
@@ -20,15 +20,14 @@ fn strip_reasoning(text: &str) -> &str {
     }
 }
 
-// strip_fences unwraps a ```json ... ``` block, which most instruct-tuned models add whether or not
-// they were asked to.
+// most instruct-tuned models wrap their reply in a fenced block whether or not they were asked to
 fn strip_fences(text: &str) -> &str {
     let Some(open) = text.find("```") else {
         return text;
     };
     let after = &text[open + 3..];
     let body = match after.find('\n') {
-        // the opening fence may carry a language tag: ```json
+        // the opening fence may carry a language tag
         Some(newline) if after[..newline].trim().chars().all(char::is_alphanumeric) => {
             &after[newline + 1..]
         }
@@ -40,8 +39,7 @@ fn strip_fences(text: &str) -> &str {
     }
 }
 
-// balanced_slice returns the first bracketed run whose brackets close, ignoring anything inside
-// string literals so that a brace in a description doesn't end the scan early.
+// ignores brackets inside string literals, so a brace in a description doesn't end the scan early
 fn balanced_slice(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let start = bytes.iter().position(|b| *b == b'{' || *b == b'[')?;
@@ -80,8 +78,7 @@ fn balanced_slice(text: &str) -> Option<&str> {
     None
 }
 
-// repair fixes the one malformation small models produce often enough to be worth handling: a comma
-// before a closing bracket.
+// the one malformation small models produce often enough to be worth handling: a trailing comma
 fn repair(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_string = false;
@@ -129,12 +126,12 @@ fn repair(text: &str) -> String {
     out
 }
 
-// field looks a value up under any of the names a model might have used for it.
+/// Looks a value up under any of the names a model might have used for it.
 pub fn field<'a>(object: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names.iter().find_map(|name| object.get(name))
 }
 
-// number accepts a JSON number or a number that came back quoted, which small models do freely.
+/// Accepts a JSON number, or a number that came back quoted, which small models do freely.
 pub fn number(value: &Value) -> Option<f64> {
     match value {
         Value::Number(n) => n.as_f64(),
@@ -155,7 +152,8 @@ pub fn text(value: &Value) -> Option<String> {
     }
 }
 
-// boolean accepts true/false, "true"/"yes", and 1/0.
+/// Accepts JSON booleans, the affirmative and negative words a model may use in their place, and
+/// the integers one and zero.
 pub fn boolean(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),
@@ -169,7 +167,7 @@ pub fn boolean(value: &Value) -> Option<bool> {
     }
 }
 
-// array accepts a list, or a single item where a list was asked for.
+/// Accepts a list, or a single item where a list was asked for.
 pub fn array(value: &Value) -> Vec<&Value> {
     match value {
         Value::Array(items) => items.iter().collect(),
@@ -178,9 +176,9 @@ pub fn array(value: &Value) -> Vec<&Value> {
     }
 }
 
-// sketch turns a JSON schema into a filled-in example of it. Models too small to follow a schema
-// reliably will still copy the shape of an example, so backends that can't enforce the schema send
-// this instead.
+/// Turns a JSON schema into a filled-in example of it. Models too small to follow a schema
+/// reliably will still copy the shape of an example, so backends that can't enforce a schema send
+/// this instead.
 pub fn sketch(schema: &Value) -> Value {
     match schema.get("type").and_then(Value::as_str) {
         Some("object") => {
@@ -203,7 +201,7 @@ pub fn sketch(schema: &Value) -> Value {
     }
 }
 
-// instructions is the prompt suffix for a backend that can't constrain its own output.
+/// The prompt suffix for a backend that can't constrain its own output.
 pub fn instructions(schema: &Value) -> String {
     format!(
         "Reply with JSON only. No prose, no explanation, no markdown fences. Match this shape \
