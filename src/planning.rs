@@ -1,7 +1,8 @@
 use crate::memory::Memory;
 use chrono::{DateTime, Duration, Utc};
 
-const MAX_PLAN_DEPTH: usize = 3;
+// how far Plan::generate recurses when no planner says otherwise.
+pub const MAX_PLAN_DEPTH: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct PlanStep {
@@ -71,6 +72,13 @@ pub trait Planner {
         current_action: Option<&PlanStep>,
         ctx: &PlanContext,
     ) -> Reaction;
+
+    // max_depth caps how far generate recurses. Each level multiplies the number of decompose
+    // calls, which is free for a scripted planner and expensive for a model-backed one — so the
+    // planner, not the Plan, decides how deep is worth it.
+    fn max_depth(&self) -> usize {
+        MAX_PLAN_DEPTH
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -125,7 +133,7 @@ impl Plan {
 }
 
 fn decompose_step<P: Planner>(planner: &P, step: &mut PlanStep, ctx: &PlanContext, depth: usize) {
-    if depth >= MAX_PLAN_DEPTH {
+    if depth >= planner.max_depth() {
         return;
     }
     let subs = planner.decompose(step, ctx);
@@ -208,6 +216,34 @@ mod tests {
         let plan = Plan::generate(&MockPlanner, &ctx_at(base()));
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(tree_depth(&plan.steps), MAX_PLAN_DEPTH);
+    }
+
+    // ShallowPlanner is MockPlanner with the recursion capped one level earlier. A planner that
+    // pays per decompose call wants this knob.
+    struct ShallowPlanner;
+    impl Planner for ShallowPlanner {
+        fn daily_plan(&self, ctx: &PlanContext) -> Vec<PlanStep> {
+            MockPlanner.daily_plan(ctx)
+        }
+        fn decompose(&self, step: &PlanStep, ctx: &PlanContext) -> Vec<PlanStep> {
+            MockPlanner.decompose(step, ctx)
+        }
+        fn react(&self, o: &Memory, c: Option<&PlanStep>, ctx: &PlanContext) -> Reaction {
+            MockPlanner.react(o, c, ctx)
+        }
+        fn max_depth(&self) -> usize {
+            2
+        }
+    }
+
+    #[test]
+    fn test_planner_can_cap_the_depth() {
+        let plan = Plan::generate(&ShallowPlanner, &ctx_at(base()));
+
+        assert_eq!(plan.steps.len(), 2);
+        // the day is split once and the sub-steps are left alone.
+        assert_eq!(tree_depth(&plan.steps), 2);
+        assert!(plan.steps[0].subplan.iter().all(PlanStep::is_leaf));
     }
 
     #[test]

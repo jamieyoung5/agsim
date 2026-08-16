@@ -1,17 +1,9 @@
-//! agsim is a generic regime-switching time-series simulator: agents move between states on a
-//! schedule, and each state produces characteristic metrics. This example uses that to generate a
-//! week of realistic device CPU telemetry — a daily usage rhythm (quiet overnight, busy by day, an
-//! evening load peak) — then samples it at a fixed cadence, adds a little sensor noise, and renders
-//! it as a sparkline so you can see the shape of the data.
-//!
-//! `cargo run --example timeseries`
-
 use agsim::generative::{GenerativeAgent, Mind};
 use agsim::memory::{Insight, Memory, Reflector};
 use agsim::planning::{PlanContext, PlanStep, Planner, Reaction};
 use agsim::simulation::Simulation;
 use agsim::state::{StateChangeEvent, Timeline};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_distr::{Distribution, Normal};
@@ -37,7 +29,10 @@ struct DeviceState {
 
 fn device_state(mode: &Mode, rng: &mut dyn RngCore) -> DeviceState {
     match mode {
-        Mode::Offline => DeviceState { cpu_in_use_percent: 0.0, memory_in_use_mb: 0 },
+        Mode::Offline => DeviceState {
+            cpu_in_use_percent: 0.0,
+            memory_in_use_mb: 0,
+        },
         Mode::Idle => DeviceState {
             cpu_in_use_percent: rng.gen_range(0.1..5.0),
             memory_in_use_mb: rng.gen_range(400..800),
@@ -66,14 +61,16 @@ fn interpret_mode(step: &PlanStep) -> Mode {
     }
 }
 
-// RoutineMind drives a fixed daily usage schedule; reflection and reactions are unused here, we just
-// want the regime structure.
 struct RoutineMind;
 
 impl Planner for RoutineMind {
     fn daily_plan(&self, ctx: &PlanContext) -> Vec<PlanStep> {
         let block = |desc: &str, start_h: i64, dur_h: i64| {
-            PlanStep::new(desc, ctx.now + Duration::hours(start_h), Duration::hours(dur_h))
+            PlanStep::new(
+                desc,
+                ctx.now + Duration::hours(start_h),
+                Duration::hours(dur_h),
+            )
         };
         vec![
             block("overnight offline", 0, 7),
@@ -111,7 +108,6 @@ impl Mind for RoutineMind {
     }
 }
 
-// cpu_at step-holds the last known CPU value at or before `t` from the reconstructed timeline.
 fn cpu_at(points: &[(DateTime<Utc>, f32)], t: DateTime<Utc>) -> f32 {
     let mut value = 0.0;
     for (timestamp, cpu) in points {
@@ -136,7 +132,9 @@ fn sparkline(values: &[f32]) -> String {
 }
 
 fn main() {
-    let start = Utc::now();
+    // starting on a midnight boundary, with every generator seeded, so each run draws the same
+    // week of telemetry, and the sparklines below line up with the day they describe.
+    let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
     let mut setup_rng = StdRng::seed_from_u64(1);
     let mut agent = GenerativeAgent::new(
@@ -185,7 +183,7 @@ fn main() {
         SAMPLE_MINUTES,
         DAYS
     );
-    println!("CPU usage % — each row is one day, each cell {SAMPLE_MINUTES} minutes:\n");
+    println!("CPU usage % each row is one day, each cell {SAMPLE_MINUTES} minutes:\n");
     for day in 0..DAYS {
         let slice = &series[day * SAMPLES_PER_DAY..(day + 1) * SAMPLES_PER_DAY];
         let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
