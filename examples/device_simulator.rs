@@ -1,7 +1,7 @@
 use agsim::agent::{Agent, StateType};
 use agsim::simulation::Simulation;
 use agsim::state::Timeline;
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use state_macros::{State, StateDisplay};
@@ -97,7 +97,9 @@ fn main() {
     );
 
     let mut agents = Vec::new();
-    let start_time = Utc::now();
+
+    // a fixed start time keeps the run reproducible end to end
+    let start_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
     let mut rng = StdRng::seed_from_u64(42);
 
@@ -110,10 +112,15 @@ fn main() {
         ));
     }
 
+    // Simulation::new seeds itself from entropy, so this run will differ each time
     let mut sim = Simulation::new(agents, start_time);
     let events = sim.run(Duration::days(7));
 
-    println!("Generated {} events over 7 days.", events.len());
+    println!(
+        "Generated {} events over 7 days (seed {}).",
+        events.len(),
+        sim.seed()
+    );
 
     let timelines = Timeline::generate(&events);
 

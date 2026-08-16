@@ -13,7 +13,22 @@ license = "GPL-3.0"
 repository = "https://github.com/jamieyoung5/agsim"
 
 [features]
+# llm brings in the model-backed Mind: prompting, lenient parsing, and the two HTTP backends
+# (Anthropic and any OpenAI-compatible server).
 llm = ["dep:ureq", "dep:serde_json"]
+# local adds the candle backend, which runs a quantized model inside the simulation process. It's a
+# heavy build — several minutes and a few GB of dependencies — so it's off by default.
+local = [
+    "llm",
+    "dep:candle-core",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+# GPU acceleration for the local backend. Pick the one matching your hardware; without either,
+# candle runs on the CPU.
+cuda = ["local", "candle-core/cuda", "candle-transformers/cuda"]
+metal = ["local", "candle-core/metal", "candle-transformers/metal"]
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
@@ -23,6 +38,14 @@ rand = "0.8.5"
 rand_distr = "0.4"
 ureq = { version = "2", optional = true, features = ["json"] }
 serde_json = { version = "1", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.23", optional = true }
+hf-hub = { version = "1.0", features = ["blocking", "rustls-tls"], optional = true }
 
 [lib]
 path = "src/lib.rs"
+
+[[example]]
+name = "small_model"
+required-features = ["llm"]

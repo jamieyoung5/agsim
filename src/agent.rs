@@ -42,9 +42,10 @@ where
     }
 }
 
-// SimAgent is the interface the Simulation drives. The Markov Agent implements it via its
-// transition matrix; richer agents (e.g. memory/plan driven) can decide their own transitions and
-// consume the events they emit through observe.
+/// The interface [`Simulation`](crate::simulation::Simulation) drives. [`Agent`] implements it via
+/// its transition matrix; richer agents such as
+/// [`GenerativeAgent`](crate::generative::GenerativeAgent) decide their own transitions and consume
+/// the events they emit through [`observe`](Self::observe).
 pub trait SimAgent {
     type State;
 
@@ -58,8 +59,8 @@ pub trait SimAgent {
     ) -> Vec<StateChangeEvent>;
     fn observe(&mut self, _event: &StateChangeEvent) {}
 
-    // location is the agent's position in the world, used for proximity-based perception. Agents
-    // without a location (the default) perceive nothing under Perception::Proximity.
+    /// The agent's position, for proximity-based perception. Agents without one (the default)
+    /// perceive nothing under [`Perception::Proximity`](crate::simulation::Perception::Proximity).
     fn location(&self) -> Option<Position> {
         None
     }
@@ -114,13 +115,11 @@ where
 {
     type State = C;
 
-    // peek_next_event_delay draws the time until the next event from an exponential distribution
-    // keyed on the current state's event rate. Time is unused: a Markov agent's timing is memoryless.
+    // `now` is unused: a Markov agent's timing is memoryless.
     fn peek_next_event_delay(&self, _now: DateTime<Utc>, rng: &mut dyn RngCore) -> Option<f64> {
         let current_def = self.transition_matrix.get(&self.current_state_type)?;
 
-        // lambda = 1 / Mean.
-        // if the mean is 0, we can assume instant transition
+        // a non-positive mean means no exponential to draw from, so the agent stops transitioning
         if current_def.event_rate <= 0.0 {
             return None;
         }
@@ -131,7 +130,6 @@ where
         Some(exp.sample(rng))
     }
 
-    // step picks the next state type by sampling the current state's weighted transitions.
     fn step(&self, _now: DateTime<Utc>, rng: &mut dyn RngCore) -> Option<C> {
         let current_def = self.transition_matrix.get(&self.current_state_type)?;
 

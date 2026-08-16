@@ -1,5 +1,6 @@
-// Position is a point in the simulated world, used for proximity-based perception. Coordinates are
-// unitless — interpret the radius in the same units.
+/// A point in the simulated world, for proximity-based perception. Coordinates are unitless;
+/// interpret [`Perception::Proximity`](crate::simulation::Perception::Proximity)'s radius in the
+/// same units.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Position {
     pub x: f64,

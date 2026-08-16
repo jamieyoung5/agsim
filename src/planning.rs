@@ -1,7 +1,8 @@
 use crate::memory::Memory;
 use chrono::{DateTime, Duration, Utc};
 
-const MAX_PLAN_DEPTH: usize = 3;
+// how far Plan::generate recurses when no planner says otherwise.
+pub const MAX_PLAN_DEPTH: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct PlanStep {
@@ -33,7 +34,7 @@ impl PlanStep {
         self.subplan.is_empty()
     }
 
-    // leaf_at descends to the finest sub-step active at now, or None if now lies outside this step.
+    // descends to the finest sub-step active at now
     pub fn leaf_at(&self, now: DateTime<Utc>) -> Option<&PlanStep> {
         if !self.contains(now) {
             return None;
@@ -60,8 +61,8 @@ pub enum Reaction {
     Replan(Vec<PlanStep>),
 }
 
-// Planner is the model-backed half of planning: it decides what goes in the plan and whether to
-// react. The recursion, current-action lookup, and replanning are handled by Plan.
+/// Decides what goes in a plan and whether to react to an observation. The recursion,
+/// current-action lookup, and replanning are handled by [`Plan`].
 pub trait Planner {
     fn daily_plan(&self, ctx: &PlanContext) -> Vec<PlanStep>;
     fn decompose(&self, step: &PlanStep, ctx: &PlanContext) -> Vec<PlanStep>;
@@ -71,6 +72,13 @@ pub trait Planner {
         current_action: Option<&PlanStep>,
         ctx: &PlanContext,
     ) -> Reaction;
+
+    /// Caps how far [`Plan::generate`] recurses. Each level multiplies the number of
+    /// [`decompose`](Self::decompose) calls, which is free for a scripted planner and expensive for
+    /// a model-backed one, so the planner decides how deep is worth it.
+    fn max_depth(&self) -> usize {
+        MAX_PLAN_DEPTH
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -79,7 +87,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    // generate lays out the day's broad strokes and recursively decomposes each one.
+    /// Lays out the day's broad strokes and recursively decomposes each one.
     pub fn generate<P: Planner>(planner: &P, ctx: &PlanContext) -> Self {
         let mut steps = planner.daily_plan(ctx);
         for step in &mut steps {
@@ -92,8 +100,7 @@ impl Plan {
         self.steps.iter().find_map(|s| s.leaf_at(now))
     }
 
-    // react applies the Planner's verdict on an observation, replanning if it decides to. Returns
-    // true when the plan changed.
+    /// Applies the [`Planner`]'s verdict on an observation. Returns true when the plan changed.
     pub fn react<P: Planner>(
         &mut self,
         planner: &P,
@@ -110,8 +117,8 @@ impl Plan {
         }
     }
 
-    // replan_from drops everything scheduled at or after now and appends a new tail. The step
-    // straddling now is trimmed to end there.
+    /// Drops everything scheduled at or after `now` and appends a new tail. The step straddling
+    /// `now` is trimmed to end there.
     pub fn replan_from(&mut self, now: DateTime<Utc>, new_steps: Vec<PlanStep>) {
         self.steps.retain(|s| s.start < now);
         if let Some(last) = self.steps.last_mut()
@@ -125,7 +132,7 @@ impl Plan {
 }
 
 fn decompose_step<P: Planner>(planner: &P, step: &mut PlanStep, ctx: &PlanContext, depth: usize) {
-    if depth >= MAX_PLAN_DEPTH {
+    if depth >= planner.max_depth() {
         return;
     }
     let subs = planner.decompose(step, ctx);
@@ -208,6 +215,34 @@ mod tests {
         let plan = Plan::generate(&MockPlanner, &ctx_at(base()));
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(tree_depth(&plan.steps), MAX_PLAN_DEPTH);
+    }
+
+    // ShallowPlanner is MockPlanner with the recursion capped one level earlier. A planner that
+    // pays per decompose call wants this knob.
+    struct ShallowPlanner;
+    impl Planner for ShallowPlanner {
+        fn daily_plan(&self, ctx: &PlanContext) -> Vec<PlanStep> {
+            MockPlanner.daily_plan(ctx)
+        }
+        fn decompose(&self, step: &PlanStep, ctx: &PlanContext) -> Vec<PlanStep> {
+            MockPlanner.decompose(step, ctx)
+        }
+        fn react(&self, o: &Memory, c: Option<&PlanStep>, ctx: &PlanContext) -> Reaction {
+            MockPlanner.react(o, c, ctx)
+        }
+        fn max_depth(&self) -> usize {
+            2
+        }
+    }
+
+    #[test]
+    fn test_planner_can_cap_the_depth() {
+        let plan = Plan::generate(&ShallowPlanner, &ctx_at(base()));
+
+        assert_eq!(plan.steps.len(), 2);
+        // the day is split once and the sub-steps are left alone.
+        assert_eq!(tree_depth(&plan.steps), 2);
+        assert!(plan.steps[0].subplan.iter().all(PlanStep::is_leaf));
     }
 
     #[test]
