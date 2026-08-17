@@ -6,18 +6,20 @@ members = [
 
 [package]
 name = "agsim"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
-description = "A discrete event simulation library."
-license = "GPL-3.0"
+description = "Discrete-event simulation framework for generating realistic synthetic time-series."
+license = "GPL-3.0-only"
 repository = "https://github.com/jamieyoung5/agsim"
+rust-version = "1.88"
+keywords = ["simulation", "discrete-event", "agent-based", "synthetic-data", "time-series"]
+categories = ["simulation", "science"]
 
 [features]
 # llm brings in the model-backed Mind: prompting, lenient parsing, and the two HTTP backends
 # (Anthropic and any OpenAI-compatible server).
 llm = ["dep:ureq", "dep:serde_json"]
-# local adds the candle backend, which runs a quantized model inside the simulation process. It's a
-# heavy build — several minutes and a few GB of dependencies — so it's off by default.
+# local adds the candle backend, which runs a quantized model inside the simulation process.
 local = [
     "llm",
     "dep:candle-core",
@@ -25,7 +27,7 @@ local = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
-# GPU acceleration for the local backend. Pick the one matching your hardware; without either,
+# GPU acceleration for the local backend. Without either,
 # candle runs on the CPU.
 cuda = ["local", "candle-core/cuda", "candle-transformers/cuda"]
 metal = ["local", "candle-core/metal", "candle-transformers/metal"]
@@ -45,6 +47,9 @@ hf-hub = { version = "1.0", features = ["blocking", "rustls-tls"], optional = tr
 
 [lib]
 path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+features = ["llm"]
 
 [[example]]
 name = "small_model"
