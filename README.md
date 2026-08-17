@@ -132,11 +132,9 @@ Speed affects when events surface, not which ones occur.
 
 ## Feature flags
 
-| flag | adds |
-| --- | --- |
-| **llm** | LlmMind and the HTTP backends (Anthropic, OpenAI-compatible) |
-| **local** | the Candle backend, running a quantized model in-process. Slow to build |
-| **cuda / metal** | GPU acceleration for local |
+- **llm**: LlmMind and the HTTP backends (Anthropic, OpenAI-compatible)
+- **local**: the Candle backend, running a quantized model in-process. Slow to build
+- **cuda / metal**: GPU acceleration for local
 
 ## Examples
 
