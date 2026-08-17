@@ -267,9 +267,18 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    fn seconds_to_duration(seconds: f64) -> Duration {
-        let millis = (seconds * 1000.0).round() as i64;
-        Duration::milliseconds(millis)
+    // an event the timeline can't hold is one that never happens, so the agent goes unscheduled
+    fn schedule_time(from: DateTime<Utc>, delay_sec: f64) -> Option<DateTime<Utc>> {
+        if !delay_sec.is_finite() || delay_sec < 0.0 {
+            return None;
+        }
+
+        let millis = (delay_sec * 1000.0).round();
+        if millis > i64::MAX as f64 {
+            return None;
+        }
+
+        from.checked_add_signed(Duration::try_milliseconds(millis as i64)?)
     }
 
     fn schedule_next_event(
@@ -288,7 +297,9 @@ impl<A: SimAgent> Simulation<A> {
             return;
         };
 
-        let event_time = self.current_time + Self::seconds_to_duration(delay_sec);
+        let Some(event_time) = Self::schedule_time(self.current_time, delay_sec) else {
+            return;
+        };
         queue.push(ScheduledEvent {
             time: event_time,
             agent_index,
@@ -645,6 +656,64 @@ mod tests {
 
         let ids: Vec<_> = events.iter().map(|e| e.agent_id.as_str()).collect();
         assert_eq!(ids, vec!["first", "second", "third"]);
+    }
+
+    struct WildDelayAgent {
+        delay: f64,
+    }
+
+    impl SimAgent for WildDelayAgent {
+        type State = ();
+
+        fn peek_next_event_delay(
+            &self,
+            _now: DateTime<Utc>,
+            _rng: &mut dyn RngCore,
+        ) -> Option<f64> {
+            Some(self.delay)
+        }
+
+        fn step(&self, _now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<()> {
+            Some(())
+        }
+
+        fn apply_transition(
+            &mut self,
+            _next: (),
+            _time: DateTime<Utc>,
+            _rng: &mut dyn RngCore,
+        ) -> Vec<StateChangeEvent> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_unrepresentable_delays_leave_the_agent_unscheduled() {
+        for delay in [f64::INFINITY, f64::NAN, -1.0, 1e30] {
+            let mut sim = Simulation::new_with_seed(vec![WildDelayAgent { delay }], base(), 1);
+            assert!(sim.run(Duration::hours(1)).is_empty(), "delay {delay}");
+            assert_eq!(sim.current_time(), base());
+        }
+    }
+
+    #[test]
+    fn test_infinite_event_rate_does_not_panic() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut transitions = HashMap::new();
+
+        transitions.insert(
+            SimState::Step1,
+            StateType::new_deterministic(
+                || MockState { counter: 1 },
+                vec![(SimState::Step2, 1.0)],
+                f64::INFINITY,
+            ),
+        );
+
+        let agent = Agent::new("wild".to_string(), SimState::Step1, transitions, &mut rng);
+        let mut sim = Simulation::new_with_seed(vec![agent], base(), 1);
+
+        assert!(sim.run(Duration::hours(1)).is_empty());
     }
 
     struct MockClock {

@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "agsim"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 description = "Discrete-event simulation framework for generating realistic synthetic time-series."
 license = "GPL-3.0-only"
