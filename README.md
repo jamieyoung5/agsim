@@ -4,13 +4,14 @@
 [![docs.rs](https://docs.rs/agsim/badge.svg)](https://docs.rs/agsim)
 [![license](https://img.shields.io/crates/l/agsim.svg)](LICENSE)
 
-Discrete-event simulation for agent-based systems in Rust. Events come off a priority queue, so
-state changes happen at irregular times rather than on a fixed tick. Intended for generating
-synthetic time-series: device telemetry, server fleets, user sessions.
+agsim is a discrete-event simulation framework. It is built to generate deterministic synthetic time-series data using either simple Markov agents or LLM-backed generative architectures.
 
 ```toml
 [dependencies]
-agsim = "1.0"
+agsim = "2.0"
+state_macros = "0.2" # the State and StateDisplay derives
+chrono = "0.4"       # timestamps appear in the public API
+rand = "0.8"         # so do the RNG traits
 ```
 
 ## Quickstart
@@ -19,6 +20,14 @@ An `Agent` is a continuous-time Markov chain. Give it one `StateType` per mode: 
 emit, the weighted transitions out, and the mean seconds spent there.
 
 ```rust
+use agsim::agent::{Agent, StateType};
+use agsim::simulation::Simulation;
+use chrono::{Duration, TimeZone, Utc};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use state_macros::{State, StateDisplay};
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Mode { Idle, Working }
 
@@ -50,14 +59,20 @@ let events = sim.run(Duration::days(1));
 
 `run` returns a `Vec<StateChangeEvent>`, one per field that changed:
 
-```
+```text
 2026-01-01 00:01:16.561 UTC device_1 cpu_percent: 2.680131 -> 3.5044582
 2026-01-01 00:28:21.644 UTC device_2 cpu_percent: 1.3188176 -> 33.948612
+2026-01-01 00:48:06.625 UTC device_2 cpu_percent: 33.948612 -> 2.2853847
 ```
 
-Same seed, agents, and start time replay the same log. Each agent draws from its own substream, so
-inserting or reordering agents leaves the others alone. `Simulation::new` seeds from OS entropy and
-reports it as `sim.seed()`.
+### Determinism
+
+> The same seed, agents, and start time replay the exact same log. Each agent draws from its own
+> PRNG substream, so agents can be inserted or reordered without perturbing the timelines of the
+> others.
+
+`Simulation::new` seeds from OS entropy instead and reports what it drew as `sim.seed()`, so an
+interesting random run can be pinned down with `new_with_seed` afterwards.
 
 ## Generative agents
 
@@ -67,12 +82,22 @@ time-of-day structure. It takes a `Mind` (planning and reflection) plus two func
 plan step to a mode, one mapping a mode to metrics.
 
 ```rust
+use agsim::generative::GenerativeAgent;
+
 let agent = GenerativeAgent::new(
-    id.clone(),
-    id,             // identity, passed to the planner as context
-    device_state,   // fn(&Mode, &mut dyn RngCore) -> Device
-    interpret_mode, // fn(&PlanStep) -> Mode
-    ScriptedMind,   // impl Mind
+    "thermostat_0".to_string(),
+    "a home thermostat".to_string(), // identity, passed to the planner as context
+    // mode -> metrics
+    |mode, rng| match mode {
+        Mode::Idle => Device { cpu_percent: rng.gen_range(0.1..5.0) },
+        Mode::Working => Device { cpu_percent: rng.gen_range(10.0..90.0) },
+    },
+    // plan step -> mode. a model writes prose, so match loosely on what it wrote
+    |step| match step.description.contains("heat") {
+        true => Mode::Working,
+        false => Mode::Idle,
+    },
+    ScriptedMind, // impl Mind: see examples/generative_device.rs
     start,
     &mut rng,
 );
@@ -82,7 +107,9 @@ With the `llm` feature a model does the planning, over `Anthropic`, `OpenAiCompa
 llama.cpp, vLLM, LM Studio), or `Candle` in-process:
 
 ```rust
-let mind = agsim::llm::LlmMind::from_env("a home thermostat")?; // reads ANTHROPIC_API_KEY
+// from_env fails if ANTHROPIC_API_KEY is unset
+let mind = agsim::llm::LlmMind::from_env("a home thermostat")
+    .expect("ANTHROPIC_API_KEY must be set");
 ```
 
 ## Live runs
@@ -90,6 +117,9 @@ let mind = agsim::llm::LlmMind::from_env("a home thermostat")?; // reads ANTHROP
 `run_live` paces against the wall clock and streams events instead of returning them at the end:
 
 ```rust
+use agsim::clock::Live;
+use std::ops::ControlFlow;
+
 let live = Live::at_speed(60.0); // one simulated minute per real second
 let stop = live.stop_signal();   // clone into a Ctrl-C handler
 sim.run_live(live, |event| {
@@ -102,11 +132,9 @@ Speed affects when events surface, not which ones occur.
 
 ## Feature flags
 
-| flag | adds |
-| --- | --- |
-| `llm` | `LlmMind` and the HTTP backends (Anthropic, OpenAI-compatible) |
-| `local` | the `Candle` backend, running a quantized model in-process. Slow to build |
-| `cuda` / `metal` | GPU acceleration for `local` |
+- **llm**: LlmMind and the HTTP backends (Anthropic, OpenAI-compatible)
+- **local**: the Candle backend, running a quantized model in-process. Slow to build
+- **cuda / metal**: GPU acceleration for local
 
 ## Examples
 
@@ -115,6 +143,8 @@ cargo run --example device_simulator   # Markov fleet, with timeline output
 cargo run --example generative_device  # planning, memory, reflection. offline, no API key
 cargo run --example timeseries         # a week of CPU telemetry, sampled and sparklined
 cargo run --example live_simulation    # wall-clock paced streaming
+
+cargo run --features llm --example small_model  # planning against a local OpenAI-compatible server
 ```
 
 ## License
