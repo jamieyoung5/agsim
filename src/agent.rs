@@ -119,8 +119,9 @@ where
     fn peek_next_event_delay(&self, _now: DateTime<Utc>, rng: &mut dyn RngCore) -> Option<f64> {
         let current_def = self.transition_matrix.get(&self.current_state_type)?;
 
-        // a non-positive mean means no exponential to draw from, so the agent stops transitioning
-        if current_def.event_rate <= 0.0 {
+        // a mean that isnt positive and finite has no exponential to draw from, so the agent
+        // stops transitioning
+        if !current_def.event_rate.is_finite() || current_def.event_rate <= 0.0 {
             return None;
         }
 
