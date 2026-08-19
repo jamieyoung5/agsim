@@ -61,6 +61,23 @@ pub trait Reflector {
     }
 }
 
+/// Caps how much of a memory stream a retrieval scores.
+///
+/// Set through [`MemoryStream::set_retrieval_bounds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrievalBounds {
+    /// How many of the most recent memories are always scored.
+    pub recent: usize,
+    /// How many of the highest-importance memories stay reachable regardless of age.
+    pub important: usize,
+}
+
+impl RetrievalBounds {
+    pub fn new(recent: usize, important: usize) -> Self {
+        RetrievalBounds { recent, important }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RetrievalWeights {
     pub recency: f64,
@@ -95,6 +112,9 @@ pub struct MemoryStream {
     pub weights: RetrievalWeights,
     pub reflection_threshold: f64,
     importance_since_reflection: f64,
+    bounds: Option<RetrievalBounds>,
+    /// Positions of the most important memories, highest first. Empty unless bounded.
+    important: Vec<usize>,
 }
 
 impl Default for MemoryStream {
@@ -106,6 +126,8 @@ impl Default for MemoryStream {
             weights: RetrievalWeights::default(),
             reflection_threshold: 150.0,
             importance_since_reflection: 0.0,
+            bounds: None,
+            important: Vec::new(),
         }
     }
 }
@@ -122,7 +144,87 @@ impl MemoryStream {
         memory.id = id;
         self.importance_since_reflection += memory.importance;
         self.memories.push(memory);
+        self.note_importance(self.memories.len() - 1);
         id
+    }
+
+    /// Limits how much of the stream a retrieval scores, or removes the limit with `None`.
+    ///
+    /// Unbounded retrieval reads the whole stream, so its cost grows with every observation an
+    /// agent has ever made. A bound keeps that flat by scoring only the most recent memories plus
+    /// the most important ones, which is the pair the paper's own scoring leans on: recency finds
+    /// what just happened, importance keeps a formative memory reachable long after it scrolls out
+    /// of the window. Relevance is what such a bound gives up — an old, unimportant, but topically
+    /// perfect memory can fall outside the candidate set.
+    pub fn set_retrieval_bounds(&mut self, bounds: Option<RetrievalBounds>) {
+        self.bounds = bounds;
+        self.rebuild_important();
+    }
+
+    pub fn retrieval_bounds(&self) -> Option<RetrievalBounds> {
+        self.bounds
+    }
+
+    fn note_importance(&mut self, index: usize) {
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        if bounds.important == 0 {
+            return;
+        }
+
+        let importance = self.memories[index].importance;
+        let slot = self
+            .important
+            .iter()
+            .position(|&held| self.memories[held].importance < importance)
+            .unwrap_or(self.important.len());
+
+        if slot < bounds.important {
+            self.important.insert(slot, index);
+            self.important.truncate(bounds.important);
+        } else if self.important.len() < bounds.important {
+            self.important.push(index);
+        }
+    }
+
+    fn rebuild_important(&mut self) {
+        self.important.clear();
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        if bounds.important == 0 {
+            return;
+        }
+
+        let mut ranked: Vec<usize> = (0..self.memories.len()).collect();
+        ranked.sort_by(|&a, &b| {
+            self.memories[b]
+                .importance
+                .partial_cmp(&self.memories[a].importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        ranked.truncate(bounds.important);
+        self.important = ranked;
+    }
+
+    // the positions a retrieval is allowed to score
+    fn candidate_indices(&self) -> Vec<usize> {
+        let Some(bounds) = self.bounds else {
+            return (0..self.memories.len()).collect();
+        };
+
+        let window_start = self.memories.len().saturating_sub(bounds.recent);
+        let mut candidates: Vec<usize> = (window_start..self.memories.len()).collect();
+        // anything important enough to keep is already covered if it sits inside the window
+        candidates.extend(
+            self.important
+                .iter()
+                .copied()
+                .filter(|&index| index < window_start),
+        );
+        candidates
     }
 
     pub fn observe(
@@ -203,46 +305,87 @@ impl MemoryStream {
 
     /// Returns the `top_k` memories by combined recency, importance, and relevance score, and
     /// refreshes their access time.
+    ///
+    /// Only the returned memories are copied. Scoring runs over the stream in place, so the cost of
+    /// a retrieval does not grow with the size of the memories themselves — which matters because
+    /// an agent calls this once per observation, against a stream that gets longer every time.
     pub fn retrieve(
         &mut self,
         query: Option<&[f32]>,
         now: DateTime<Utc>,
         top_k: usize,
     ) -> Vec<ScoredMemory> {
-        let mut scored = self.score_all(query, now);
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-
-        for s in &scored {
-            if let Some(m) = self.memories.iter_mut().find(|m| m.id == s.memory.id) {
-                m.last_accessed = now;
-            }
-        }
-
-        scored
-    }
-
-    pub fn score_all(&self, query: Option<&[f32]>, now: DateTime<Utc>) -> Vec<ScoredMemory> {
-        if self.memories.is_empty() {
+        let mut scored = self.score_indices(query, now);
+        let keep = top_k.min(scored.len());
+        if keep == 0 {
             return Vec::new();
         }
 
-        let recency_raw: Vec<f64> = self
-            .memories
+        // partitioning leaves the best `keep` in front without ordering the rest of the stream
+        if keep < scored.len() {
+            scored.select_nth_unstable_by(keep - 1, Scored::rank);
+            scored.truncate(keep);
+        }
+        scored.sort_by(Scored::rank);
+
+        // the copies carry the access time the scoring saw, so refreshing it comes afterwards
+        let retrieved: Vec<ScoredMemory> = scored
             .iter()
-            .map(|m| {
-                let hours = (now - m.last_accessed).num_milliseconds() as f64 / 3_600_000.0;
+            .map(|s| ScoredMemory {
+                memory: self.memories[s.index].clone(),
+                recency: s.recency,
+                importance: s.importance,
+                relevance: s.relevance,
+                score: s.score,
+            })
+            .collect();
+
+        for s in &scored {
+            self.memories[s.index].last_accessed = now;
+        }
+
+        retrieved
+    }
+
+    pub fn score_all(&self, query: Option<&[f32]>, now: DateTime<Utc>) -> Vec<ScoredMemory> {
+        self.score_indices(query, now)
+            .into_iter()
+            .map(|s| ScoredMemory {
+                memory: self.memories[s.index].clone(),
+                recency: s.recency,
+                importance: s.importance,
+                relevance: s.relevance,
+                score: s.score,
+            })
+            .collect()
+    }
+
+    // scores the candidate memories, identifying each by position rather than copying it
+    fn score_indices(&self, query: Option<&[f32]>, now: DateTime<Utc>) -> Vec<Scored> {
+        let candidates = self.candidate_indices();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let recency_raw: Vec<f64> = candidates
+            .iter()
+            .map(|&i| {
+                let hours =
+                    (now - self.memories[i].last_accessed).num_milliseconds() as f64 / 3_600_000.0;
                 self.recency_decay.powf(hours.max(0.0))
             })
             .collect();
 
-        let importance_raw: Vec<f64> = self.memories.iter().map(|m| m.importance).collect();
-
-        let relevance_raw: Vec<f64> = self
-            .memories
+        let importance_raw: Vec<f64> = candidates
             .iter()
-            .map(|m| match (query, m.embedding.as_deref()) {
-                (Some(q), Some(e)) => cosine_similarity(q, e),
+            .map(|&i| self.memories[i].importance)
+            .collect();
+
+        let query_squared_norm = query.map(squared_norm).unwrap_or(0.0);
+        let relevance_raw: Vec<f64> = candidates
+            .iter()
+            .map(|&i| match (query, self.memories[i].embedding.as_deref()) {
+                (Some(q), Some(e)) => cosine_similarity_to(q, query_squared_norm, e),
                 _ => 0.0,
             })
             .collect();
@@ -251,22 +394,38 @@ impl MemoryStream {
         let importance = min_max_normalize(&importance_raw);
         let relevance = min_max_normalize(&relevance_raw);
 
-        self.memories
+        candidates
             .iter()
             .enumerate()
-            .map(|(i, m)| {
-                let score = self.weights.recency * recency[i]
-                    + self.weights.importance * importance[i]
-                    + self.weights.relevance * relevance[i];
-                ScoredMemory {
-                    memory: m.clone(),
-                    recency: recency[i],
-                    importance: importance[i],
-                    relevance: relevance[i],
-                    score,
-                }
+            .map(|(slot, &index)| Scored {
+                index,
+                recency: recency[slot],
+                importance: importance[slot],
+                relevance: relevance[slot],
+                score: self.weights.recency * recency[slot]
+                    + self.weights.importance * importance[slot]
+                    + self.weights.relevance * relevance[slot],
             })
             .collect()
+    }
+}
+
+/// A scored memory identified by its position in the stream rather than by a copy of itself.
+struct Scored {
+    index: usize,
+    recency: f64,
+    importance: f64,
+    relevance: f64,
+    score: f64,
+}
+
+impl Scored {
+    // highest score first, ties settled by stream order so a retrieval is a total, stable ordering
+    fn rank(a: &Scored, b: &Scored) -> std::cmp::Ordering {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.index.cmp(&b.index))
     }
 }
 
@@ -282,26 +441,30 @@ fn min_max_normalize(values: &[f64]) -> Vec<f64> {
     values.iter().map(|v| (v - min) / range).collect()
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() {
+fn squared_norm(vector: &[f32]) -> f64 {
+    vector.iter().map(|x| *x as f64 * *x as f64).sum()
+}
+
+// scoring a stream compares one query against many memories, so the query's own norm is a constant
+// across the scan and is passed in rather than recomputed per memory
+fn cosine_similarity_to(query: &[f32], query_squared_norm: f64, other: &[f32]) -> f64 {
+    if query.len() != other.len() || query_squared_norm == 0.0 {
         return 0.0;
     }
 
     let mut dot = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-    for (x, y) in a.iter().zip(b.iter()) {
+    let mut other_squared_norm = 0.0;
+    for (x, y) in query.iter().zip(other.iter()) {
         let (x, y) = (*x as f64, *y as f64);
         dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
+        other_squared_norm += y * y;
     }
 
-    if norm_a == 0.0 || norm_b == 0.0 {
+    if other_squared_norm == 0.0 {
         return 0.0;
     }
 
-    dot / (norm_a.sqrt() * norm_b.sqrt())
+    dot / (query_squared_norm.sqrt() * other_squared_norm.sqrt())
 }
 
 #[cfg(test)]
@@ -331,10 +494,16 @@ mod tests {
 
     #[test]
     fn test_cosine_similarity() {
-        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-9);
-        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-9);
-        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), 0.0);
-        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        fn similarity(query: &[f32], other: &[f32]) -> f64 {
+            cosine_similarity_to(query, squared_norm(query), other)
+        }
+
+        assert!((similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-9);
+        assert!(similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-9);
+        assert_eq!(similarity(&[1.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        // a zero-norm memory is as unmatched as a zero-norm query
+        assert_eq!(similarity(&[1.0, 1.0], &[0.0, 0.0]), 0.0);
     }
 
     #[test]
@@ -402,6 +571,159 @@ mod tests {
     }
 
     #[test]
+    fn test_top_k_beyond_the_stream_returns_everything() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+        for i in 0..3 {
+            stream.observe(format!("m{i}"), i as f64, t);
+        }
+
+        assert_eq!(stream.retrieve(None, t, 99).len(), 3);
+        assert!(stream.retrieve(None, t, 0).is_empty());
+    }
+
+    #[test]
+    fn test_retrieved_copies_carry_the_access_time_scoring_saw() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+        stream.observe("only", 1.0, t);
+
+        let later = t + Duration::hours(3);
+        let results = stream.retrieve(None, later, 1);
+
+        // the caller sees the memory as it was scored, while the stream itself moves on
+        assert_eq!(results[0].memory.last_accessed, t);
+        assert_eq!(stream.memories()[0].last_accessed, later);
+    }
+
+    #[test]
+    fn test_ties_resolve_in_stream_order() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+        // identical importance and timestamps leave score ties across the whole stream
+        for i in 0..8 {
+            stream.observe(format!("m{i}"), 1.0, t);
+        }
+
+        let ids: Vec<_> = stream
+            .retrieve(None, t, 4)
+            .iter()
+            .map(|s| s.memory.id)
+            .collect();
+
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_retrieve_agrees_with_scoring_the_whole_stream() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+        for i in 0..20 {
+            stream.observe(format!("m{i}"), (i % 5) as f64, t + Duration::minutes(i));
+        }
+
+        let now = t + Duration::hours(2);
+        let mut expected = stream.score_all(None, now);
+        expected.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.memory.id.cmp(&b.memory.id))
+        });
+
+        let retrieved = stream.retrieve(None, now, 6);
+
+        assert_eq!(retrieved.len(), 6);
+        for (got, want) in retrieved.iter().zip(expected.iter()) {
+            assert_eq!(got.memory.id, want.memory.id);
+            assert!((got.score - want.score).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_bounds_keep_retrieval_inside_the_recent_window() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+        stream.set_retrieval_bounds(Some(RetrievalBounds::new(10, 0)));
+
+        for i in 0..500 {
+            stream.observe(format!("m{i}"), 1.0, t + Duration::seconds(i));
+        }
+
+        let ids: Vec<MemoryId> = stream
+            .retrieve(None, t + Duration::seconds(500), 50)
+            .iter()
+            .map(|s| s.memory.id)
+            .collect();
+
+        // only the last ten are candidates, so a top-50 request cannot return more than ten
+        assert_eq!(ids.len(), 10);
+        assert!(ids.iter().all(|&id| id >= 490));
+    }
+
+    #[test]
+    fn test_bounds_keep_an_important_old_memory_reachable() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+        stream.set_retrieval_bounds(Some(RetrievalBounds::new(5, 2)));
+
+        let landmark = stream.observe("landmark", 100.0, t);
+        for i in 0..200 {
+            stream.observe(format!("m{i}"), 0.1, t + Duration::seconds(i + 1));
+        }
+
+        let ids: Vec<MemoryId> = stream
+            .retrieve(None, t + Duration::seconds(500), 10)
+            .iter()
+            .map(|s| s.memory.id)
+            .collect();
+
+        assert!(
+            ids.contains(&landmark),
+            "an old but important memory should survive the window: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_bounds_applied_late_still_rank_earlier_memories() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+
+        let landmark = stream.observe("landmark", 100.0, t);
+        for i in 0..100 {
+            stream.observe(format!("m{i}"), 0.1, t + Duration::seconds(i + 1));
+        }
+
+        // the important set has to be reconstructed from memories added before the bound existed
+        stream.set_retrieval_bounds(Some(RetrievalBounds::new(3, 1)));
+
+        let ids: Vec<MemoryId> = stream
+            .retrieve(None, t + Duration::seconds(500), 10)
+            .iter()
+            .map(|s| s.memory.id)
+            .collect();
+
+        assert!(ids.contains(&landmark), "{ids:?}");
+        assert_eq!(ids.len(), 4);
+    }
+
+    #[test]
+    fn test_removing_bounds_restores_a_full_scan() {
+        let t = base();
+        let mut stream = MemoryStream::new();
+        stream.set_retrieval_bounds(Some(RetrievalBounds::new(2, 0)));
+
+        for i in 0..20 {
+            stream.observe(format!("m{i}"), 1.0, t + Duration::seconds(i));
+        }
+        assert_eq!(stream.retrieve(None, t, 50).len(), 2);
+
+        stream.set_retrieval_bounds(None);
+        assert_eq!(stream.retrieval_bounds(), None);
+        assert_eq!(stream.retrieve(None, t, 50).len(), 20);
+    }
+
+    #[test]
     fn test_id_assignment() {
         let t = base();
         let mut stream = MemoryStream::new();
@@ -430,7 +752,11 @@ mod tests {
         let new_ids = stream.reflect(&MockReflector, t);
         assert_eq!(new_ids.len(), 1);
 
-        let reflection = stream.memories().iter().find(|m| m.id == new_ids[0]).unwrap();
+        let reflection = stream
+            .memories()
+            .iter()
+            .find(|m| m.id == new_ids[0])
+            .unwrap();
         assert_eq!(reflection.kind, MemoryKind::Reflection);
         assert!(reflection.evidence.iter().all(|e| *e == a || *e == b));
     }

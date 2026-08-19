@@ -29,14 +29,16 @@ pub fn state_derive(input: TokenStream) -> TokenStream {
         let field_name = f.ident.as_ref().expect("Field must have a name");
         let field_name_str = field_name.to_string();
 
+        // the field name is a compile-time constant, so the event borrows it rather than owning a
+        // fresh copy per change
         quote! {
             if self.#field_name != other.#field_name {
-                changes.push(agsim::state::StateChangeEvent {
+                out.push(agsim::state::StateChangeEvent {
                     time,
-                    agent_id: String::new(),
-                    field: #field_name_str.to_string(),
-                    old_value: self.#field_name.to_string(),
-                    new_value: other.#field_name.to_string(),
+                    agent_id: agent_id.clone(),
+                    field: ::std::borrow::Cow::Borrowed(#field_name_str),
+                    old_value: agsim::state::ToValue::to_value(&self.#field_name),
+                    new_value: agsim::state::ToValue::to_value(&other.#field_name),
                 });
             }
         }
@@ -44,10 +46,14 @@ pub fn state_derive(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl agsim::state::State for #name {
-            fn diff(&self, other: &Self, time: chrono::DateTime<chrono::Utc>) -> Vec<agsim::state::StateChangeEvent> {
-                let mut changes = Vec::new();
+            fn diff(
+                &self,
+                other: &Self,
+                agent_id: &agsim::state::AgentId,
+                time: chrono::DateTime<chrono::Utc>,
+                out: &mut Vec<agsim::state::StateChangeEvent>,
+            ) {
                 #(#diff_logic)*
-                changes
             }
         }
     };

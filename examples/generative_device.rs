@@ -129,7 +129,7 @@ impl Reflector for ScriptedMind {
 impl Mind for ScriptedMind {
     fn importance(&self, event: &StateChangeEvent) -> f64 {
         // CPU spikes and connectivity changes are more poignant than routine memory churn.
-        match event.field.as_str() {
+        match event.field.as_ref() {
             "cpu_in_use_percent" => 6.0,
             "connected_status" => 5.0,
             _ => 2.0,

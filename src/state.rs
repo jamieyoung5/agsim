@@ -1,30 +1,173 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// An agent's identity as it travels on events.
+///
+/// Every emitted change carries the id of the agent that produced it, so this is cloned far more
+/// often than it is created. Sharing one allocation between all of an agent's events keeps that
+/// clone to a reference count bump.
+pub type AgentId = Arc<str>;
+
+/// A field's value at a point in time.
+///
+/// State fields are overwhelmingly numbers and flags, and rendering those to text on every change
+/// costs an allocation and a formatting pass for a string most runs never read. Keeping the value
+/// in its own shape defers that to whoever actually displays or serializes it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum Value {
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+    Bool(bool),
+    Text(Arc<str>),
+}
+
+impl Value {
+    /// Renders any [`Display`](fmt::Display) type into a [`Value::Text`], for state fields that are
+    /// not one of the primitive shapes.
+    pub fn text(value: impl fmt::Display) -> Self {
+        Value::Text(Arc::from(value.to_string().as_str()))
+    }
+
+    /// The value as a number, whatever numeric shape it was stored in. `None` for text and flags.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Int(v) => Some(*v as f64),
+            Value::Uint(v) => Some(*v as f64),
+            Value::Float(v) => Some(*v),
+            Value::Bool(_) | Value::Text(_) => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Int(v) => Some(*v),
+            Value::Uint(v) => i64::try_from(*v).ok(),
+            Value::Float(v) => Some(*v as i64),
+            Value::Bool(_) | Value::Text(_) => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Text(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Int(v) => write!(f, "{v}"),
+            Value::Uint(v) => write!(f, "{v}"),
+            Value::Float(v) => write!(f, "{v}"),
+            Value::Bool(v) => write!(f, "{v}"),
+            Value::Text(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+/// Converts a state field into a [`Value`].
+///
+/// The `State` derive calls this for every field it compares. Implement it for field types outside
+/// the primitive set, usually by delegating to [`Value::text`].
+pub trait ToValue {
+    fn to_value(&self) -> Value;
+}
+
+macro_rules! impl_to_value {
+    ($variant:ident, $cast:ty, $($ty:ty),+) => {
+        $(
+            impl ToValue for $ty {
+                fn to_value(&self) -> Value {
+                    Value::$variant(*self as $cast)
+                }
+            }
+        )+
+    };
+}
+
+impl_to_value!(Int, i64, i8, i16, i32, i64, isize);
+impl_to_value!(Uint, u64, u8, u16, u32, u64, usize);
+impl_to_value!(Float, f64, f32, f64);
+
+impl ToValue for bool {
+    fn to_value(&self) -> Value {
+        Value::Bool(*self)
+    }
+}
+
+impl ToValue for String {
+    fn to_value(&self) -> Value {
+        Value::Text(Arc::from(self.as_str()))
+    }
+}
+
+impl ToValue for &str {
+    fn to_value(&self) -> Value {
+        Value::Text(Arc::from(*self))
+    }
+}
+
+impl ToValue for char {
+    fn to_value(&self) -> Value {
+        Value::Text(Arc::from(self.to_string().as_str()))
+    }
+}
+
+impl<T: ToValue> ToValue for &T {
+    fn to_value(&self) -> Value {
+        (*self).to_value()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StateChangeEvent {
     #[serde(rename = "Time")]
     pub time: DateTime<Utc>,
     #[serde(rename = "AgentId")]
-    pub agent_id: String,
+    pub agent_id: AgentId,
+    /// The field's name. Derived states supply a compile-time constant, so this normally borrows.
     #[serde(rename = "Field")]
-    pub field: String,
+    pub field: Cow<'static, str>,
     #[serde(rename = "NewValue")]
-    pub new_value: String,
+    pub new_value: Value,
     #[serde(rename = "OldValue")]
-    pub old_value: String,
+    pub old_value: Value,
 }
 
 pub trait State: Sized + Clone + Default {
-    fn diff(&self, other: &Self, time: DateTime<Utc>) -> Vec<StateChangeEvent>;
+    /// Appends one event per field that differs between `self` and `other`.
+    ///
+    /// Events are written into `out` rather than returned so a simulation can reuse one buffer
+    /// across every transition, and the id is supplied here so the caller does not have to walk the
+    /// results to stamp it on afterwards.
+    fn diff(
+        &self,
+        other: &Self,
+        agent_id: &AgentId,
+        time: DateTime<Utc>,
+        out: &mut Vec<StateChangeEvent>,
+    );
 }
 
 #[derive(Debug, Clone)]
 pub struct TimelineEntry {
     pub timestamp: DateTime<Utc>,
-    pub state: BTreeMap<String, String>,
+    pub state: BTreeMap<String, Value>,
     pub events: Vec<String>,
 }
 
@@ -58,14 +201,14 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    pub fn generate(events: &[StateChangeEvent]) -> HashMap<String, Timeline> {
+    pub fn generate(events: &[StateChangeEvent]) -> HashMap<AgentId, Timeline> {
         let mut timelines = HashMap::new();
 
         if events.is_empty() {
             return timelines;
         }
 
-        let mut events_by_agent: HashMap<String, Vec<StateChangeEvent>> = HashMap::new();
+        let mut events_by_agent: HashMap<AgentId, Vec<StateChangeEvent>> = HashMap::new();
         for event in events {
             events_by_agent
                 .entry(event.agent_id.clone())
@@ -94,9 +237,9 @@ impl Timeline {
         let mut seen_fields = HashSet::new();
 
         for event in &sorted_events {
-            if !seen_fields.contains(&event.field) {
-                current_state.insert(event.field.clone(), event.old_value.clone());
-                seen_fields.insert(event.field.clone());
+            if !seen_fields.contains(event.field.as_ref()) {
+                current_state.insert(event.field.to_string(), event.old_value.clone());
+                seen_fields.insert(event.field.to_string());
             }
         }
 
@@ -119,8 +262,8 @@ impl Timeline {
             let mut changed_fields = Vec::new();
 
             for event in event_group {
-                current_state.insert(event.field.clone(), event.new_value.clone());
-                changed_fields.push(event.field.clone());
+                current_state.insert(event.field.to_string(), event.new_value.clone());
+                changed_fields.push(event.field.to_string());
             }
 
             entries.push(TimelineEntry {
@@ -148,32 +291,49 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    fn event(
+        agent: &AgentId,
+        field: &'static str,
+        old: Value,
+        new: Value,
+        time: DateTime<Utc>,
+    ) -> StateChangeEvent {
+        StateChangeEvent {
+            time,
+            agent_id: agent.clone(),
+            field: Cow::Borrowed(field),
+            old_value: old,
+            new_value: new,
+        }
+    }
+
     #[test]
     fn test_timeline_generation_single_agent() {
         let base_time = Utc.timestamp_opt(1600000000, 0).unwrap();
+        let agent: AgentId = Arc::from("agent_A");
 
         let events = vec![
-            StateChangeEvent {
-                time: base_time,
-                agent_id: "agent_A".to_string(),
-                field: "status".to_string(),
-                old_value: "init".to_string(),
-                new_value: "running".to_string(),
-            },
-            StateChangeEvent {
-                time: base_time + Duration::seconds(10),
-                agent_id: "agent_A".to_string(),
-                field: "load".to_string(),
-                old_value: "0".to_string(),
-                new_value: "50".to_string(),
-            },
-            StateChangeEvent {
-                time: base_time + Duration::seconds(10),
-                agent_id: "agent_A".to_string(),
-                field: "status".to_string(),
-                old_value: "running".to_string(),
-                new_value: "busy".to_string(),
-            },
+            event(
+                &agent,
+                "status",
+                Value::text("init"),
+                Value::text("running"),
+                base_time,
+            ),
+            event(
+                &agent,
+                "load",
+                Value::Int(0),
+                Value::Int(50),
+                base_time + Duration::seconds(10),
+            ),
+            event(
+                &agent,
+                "status",
+                Value::text("running"),
+                Value::text("busy"),
+                base_time + Duration::seconds(10),
+            ),
         ];
 
         let timelines = Timeline::generate(&events);
@@ -184,18 +344,24 @@ mod tests {
         assert_eq!(timeline.entries.len(), 3);
 
         let init_entry = &timeline.entries[0];
-        assert_eq!(init_entry.state.get("status").unwrap(), "init");
-        assert_eq!(init_entry.state.get("load").unwrap(), "0");
+        assert_eq!(init_entry.state.get("status").unwrap().to_string(), "init");
+        assert_eq!(init_entry.state.get("load").unwrap().to_string(), "0");
 
         let first_trans = &timeline.entries[1];
         assert_eq!(first_trans.timestamp, base_time);
-        assert_eq!(first_trans.state.get("status").unwrap(), "running");
+        assert_eq!(
+            first_trans.state.get("status").unwrap().to_string(),
+            "running"
+        );
         assert_eq!(first_trans.events, vec!["status"]);
 
         let second_trans = &timeline.entries[2];
         assert_eq!(second_trans.timestamp, base_time + Duration::seconds(10));
-        assert_eq!(second_trans.state.get("load").unwrap(), "50");
-        assert_eq!(second_trans.state.get("status").unwrap(), "busy");
+        assert_eq!(second_trans.state.get("load").unwrap().to_string(), "50");
+        assert_eq!(
+            second_trans.state.get("status").unwrap().to_string(),
+            "busy"
+        );
         assert!(second_trans.events.contains(&"load".to_string()));
         assert!(second_trans.events.contains(&"status".to_string()));
     }
@@ -203,26 +369,52 @@ mod tests {
     #[test]
     fn test_timeline_multi_agent_separation() {
         let time = Utc::now();
+        let a: AgentId = Arc::from("A");
+        let b: AgentId = Arc::from("B");
         let events = vec![
-            StateChangeEvent {
-                time,
-                agent_id: "A".to_string(),
-                field: "f".to_string(),
-                old_value: "0".to_string(),
-                new_value: "1".to_string(),
-            },
-            StateChangeEvent {
-                time,
-                agent_id: "B".to_string(),
-                field: "f".to_string(),
-                old_value: "0".to_string(),
-                new_value: "2".to_string(),
-            },
+            event(&a, "f", Value::Int(0), Value::Int(1), time),
+            event(&b, "f", Value::Int(0), Value::Int(2), time),
         ];
 
         let timelines = Timeline::generate(&events);
         assert_eq!(timelines.len(), 2);
         assert!(timelines.contains_key("A"));
         assert!(timelines.contains_key("B"));
+    }
+
+    #[test]
+    fn test_primitive_fields_convert_without_allocating_text() {
+        assert_eq!(7i32.to_value(), Value::Int(7));
+        assert_eq!(7u8.to_value(), Value::Uint(7));
+        assert_eq!(1.5f32.to_value(), Value::Float(1.5));
+        assert_eq!(true.to_value(), Value::Bool(true));
+        assert_eq!(String::from("hi").to_value(), Value::Text(Arc::from("hi")));
+    }
+
+    #[test]
+    fn test_borrowed_field_names_clone_without_allocating() {
+        let agent: AgentId = Arc::from("a");
+        let original = event(&agent, "cpu", Value::Int(1), Value::Int(2), Utc::now());
+        let copy = original.clone();
+
+        assert!(matches!(copy.field, Cow::Borrowed(_)));
+        assert!(Arc::ptr_eq(&original.agent_id, &copy.agent_id));
+    }
+
+    #[test]
+    fn test_event_round_trips_through_serde() {
+        let agent: AgentId = Arc::from("a");
+        let original = event(
+            &agent,
+            "cpu",
+            Value::Int(1),
+            Value::Float(2.5),
+            Utc.timestamp_opt(1600000000, 0).unwrap(),
+        );
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: StateChangeEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original, restored);
     }
 }

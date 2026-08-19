@@ -161,8 +161,8 @@ fn main() {
             let cpu = entry
                 .state
                 .get("cpu_in_use_percent")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0.0);
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0) as f32;
             (entry.timestamp, cpu)
         })
         .collect();
