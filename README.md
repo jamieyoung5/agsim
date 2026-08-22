@@ -10,8 +10,8 @@ Deterministic discrete-event simulation for synthetic time-series data.
 
 ```toml
 [dependencies]
-agsim = "2.0"
-state_macros = "0.2"
+agsim = "2.1"
+state_macros = "0.3"
 chrono = "0.4"
 rand = "0.8"
 ```

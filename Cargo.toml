@@ -38,7 +38,7 @@ serde_json = "1"
 [dependencies]
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 chrono = { version = "0.4", features = ["serde"] }
-state_macros = { version = "0.2.0", path = "state_macros" }
+state_macros = { version = "0.3.0", path = "state_macros" }
 rand = "0.8.5"
 rand_distr = "0.4"
 ureq = { version = "2", optional = true, features = ["json"] }
