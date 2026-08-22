@@ -1,9 +1,4 @@
-//! Counts heap traffic on the simulation's hot path.
-//!
-//! Throughput work eventually runs into "where is the time going", and on this event loop the
-//! answer is dominated by allocation: every emitted change carries four owned `String`s. This
-//! example wraps the system allocator in a counter and reports allocations and bytes per event, so
-//! the cost of the event representation can be argued about with numbers.
+// heap traffic per event
 
 use agsim::agent::{Agent, SimAgent, StateType, Transitions};
 use agsim::simulation::Simulation;
@@ -53,45 +48,45 @@ fn snapshot() -> (u64, u64) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-enum TraderMode {
-    Flat,
-    Bidding,
-    Offering,
-    Holding,
+enum Mode {
+    Idle,
+    Active,
+    Busy,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Default, State, StateDisplay)]
-struct TraderState {
-    position: i64,
-    working_orders: u32,
-    quote_price: i64,
-    exposure: i64,
+struct Metrics {
+    level: i64,
+    pending: u32,
+    signal: i64,
+    total: i64,
 }
 
-fn transitions() -> HashMap<TraderMode, StateType<TraderMode, TraderState>> {
+fn transitions() -> HashMap<Mode, StateType<Mode, Metrics>> {
     let mut matrix = HashMap::new();
     let modes = [
-        (TraderMode::Flat, 45.0),
-        (TraderMode::Bidding, 20.0),
-        (TraderMode::Offering, 20.0),
-        (TraderMode::Holding, 90.0),
+        (Mode::Idle, 45.0),
+        (Mode::Active, 20.0),
+        (Mode::Busy, 20.0),
+        (Mode::Blocked, 90.0),
     ];
 
     for (mode, rate) in modes {
         matrix.insert(
             mode,
             StateType::new(
-                |rng| TraderState {
-                    position: rng.gen_range(-800..800),
-                    working_orders: rng.gen_range(0..8),
-                    quote_price: rng.gen_range(9_000..11_000),
-                    exposure: rng.gen_range(0..400_000),
+                |rng| Metrics {
+                    level: rng.gen_range(-800..800),
+                    pending: rng.gen_range(0..8),
+                    signal: rng.gen_range(9_000..11_000),
+                    total: rng.gen_range(0..400_000),
                 },
                 vec![
-                    (TraderMode::Flat, 0.25),
-                    (TraderMode::Bidding, 0.25),
-                    (TraderMode::Offering, 0.25),
-                    (TraderMode::Holding, 0.25),
+                    (Mode::Idle, 0.25),
+                    (Mode::Active, 0.25),
+                    (Mode::Busy, 0.25),
+                    (Mode::Blocked, 0.25),
                 ],
                 rate,
             ),
@@ -101,11 +96,7 @@ fn transitions() -> HashMap<TraderMode, StateType<TraderMode, TraderState>> {
     matrix
 }
 
-/// Emits a fixed number of changes per transition, building each event either the way the current
-/// representation does or the way the old all-owned-`String` one did.
-///
-/// The gap between the two runs is the whole cost the old shape carried: four allocations, four
-/// integer-to-decimal conversions and four copies per event. Nothing else differs between them.
+/// Emits four changes per transition.
 struct SyntheticAgent {
     id: AgentId,
     legacy: bool,
@@ -138,12 +129,10 @@ impl SimAgent for SyntheticAgent {
         out: &mut Vec<StateChangeEvent>,
     ) {
         self.counter += 1;
-        const FIELDS: [&str; 4] = ["position", "working_orders", "quote_price", "exposure"];
+        const FIELDS: [&str; 4] = ["level", "pending", "signal", "total"];
 
         for field in FIELDS {
             out.push(if self.legacy {
-                // what the old representation cost: a fresh id, an owned field name, and both
-                // values rendered to text
                 StateChangeEvent {
                     time,
                     agent_id: Arc::from(self.id.as_ref()),
@@ -167,7 +156,7 @@ impl SimAgent for SyntheticAgent {
 fn synthetic_throughput(agents_count: usize, legacy: bool) -> (f64, u64, u64) {
     let agents: Vec<_> = (0..agents_count)
         .map(|index| SyntheticAgent {
-            id: Arc::from(format!("trader_{index:07}").as_str()),
+            id: Arc::from(format!("agent_{index:07}").as_str()),
             legacy,
             counter: 0,
         })
@@ -187,8 +176,8 @@ fn synthetic_throughput(agents_count: usize, legacy: bool) -> (f64, u64, u64) {
 }
 
 fn main() {
-    let agents_count: usize = std::env::args()
-        .nth(1)
+    let agents_count: usize = args()
+        .first()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(5_000);
 
@@ -199,8 +188,8 @@ fn main() {
     let agents: Vec<_> = (0..agents_count)
         .map(|index| {
             Agent::with_shared_transitions(
-                format!("trader_{index:07}"),
-                TraderMode::Flat,
+                format!("agent_{index:07}"),
+                Mode::Idle,
                 Arc::clone(&shared),
                 &mut rng,
             )
@@ -264,4 +253,12 @@ fn main() {
         "headroom          {:.2}x",
         (slow_events as f64 / slow_sec).recip() / (fast_events as f64 / fast_sec).recip()
     );
+}
+
+// cargo bench passes --bench
+fn args() -> Vec<String> {
+    std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .collect()
 }

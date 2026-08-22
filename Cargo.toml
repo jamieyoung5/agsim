@@ -58,3 +58,21 @@ features = ["llm"]
 [[example]]
 name = "small_model"
 required-features = ["llm"]
+
+# the benches print measurement tables rather than reporting to a harness, so each is a plain
+# binary run with `cargo bench --bench <name> -- <args>`.
+[[bench]]
+name = "stress"
+harness = false
+
+[[bench]]
+name = "world"
+harness = false
+
+[[bench]]
+name = "alloc_profile"
+harness = false
+
+[[bench]]
+name = "memory_scaling"
+harness = false

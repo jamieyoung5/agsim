@@ -45,18 +45,10 @@ where
     }
 }
 
-/// The interface [`Simulation`](crate::simulation::Simulation) drives. [`Agent`] implements it via
-/// its transition matrix; richer agents such as
-/// [`GenerativeAgent`](crate::generative::GenerativeAgent) decide their own transitions and consume
-/// the events they emit through [`observe`](Self::observe).
+/// The interface a [`Simulation`](crate::simulation::Simulation) drives.
 pub trait SimAgent {
     type State;
 
-    /// Shared state the simulation maintains and every agent can read.
-    ///
-    /// Use `()` for agents that only react to events pushed through [`observe`](Self::observe).
-    /// A population too large to notify one by one reads an aggregate here instead, which costs the
-    /// simulation one fold per change rather than one call per agent per change.
     type World: World;
 
     fn peek_next_event_delay(
@@ -73,10 +65,7 @@ pub trait SimAgent {
         rng: &mut dyn RngCore,
     ) -> Option<Self::State>;
 
-    /// Moves the agent into `next`, appending one event per field that changed.
-    ///
-    /// Events go into `out`, which the simulation reuses across transitions, so implementations
-    /// append rather than assuming it starts empty.
+    /// Moves into `next`, appending changed fields.
     fn apply_transition(
         &mut self,
         next: Self::State,
@@ -88,35 +77,28 @@ pub trait SimAgent {
 
     fn observe(&mut self, _event: &StateChangeEvent) {}
 
-    /// The agent's position, for proximity-based perception. Agents without one (the default)
-    /// perceive nothing under [`Perception::Proximity`](crate::simulation::Perception::Proximity).
+    /// Position for proximity perception.
     fn location(&self) -> Option<Position> {
         None
     }
 }
 
-/// One state of a compiled transition matrix.
-///
-/// Outgoing edges are stored as positions in the same table and the samplers are built once, so
-/// stepping an agent costs an array index and a draw rather than a hash lookup and a fresh
-/// distribution per event.
+/// A state's slot in a [`Transitions`] table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StateId(usize);
+
 struct CompiledState<S> {
-    /// `None` for the dormant state, which produces no data and no events.
     factory: Option<Factory<S>>,
-    targets: Vec<usize>,
+    targets: Vec<StateId>,
     picker: Option<WeightedIndex<f64>>,
     delay: Option<Exp<f64>>,
 }
 
-/// A transition matrix resolved into a flat table.
-///
-/// Build this once and share it across a population with
-/// [`Agent::with_shared_transitions`](Agent::with_shared_transitions); holding one per agent
-/// duplicates the whole table.
+/// A transition matrix as a flat table.
 pub struct Transitions<C, S: State> {
     states: Vec<CompiledState<S>>,
     keys: Vec<Option<C>>,
-    index_of: HashMap<C, usize>,
+    index_of: HashMap<C, StateId>,
 }
 
 impl<C, S> Transitions<C, S>
@@ -130,14 +112,12 @@ where
         let mut defs = Vec::with_capacity(matrix.len());
 
         for (key, def) in matrix {
-            index_of.insert(key.clone(), keys.len());
+            index_of.insert(key.clone(), StateId(keys.len()));
             keys.push(Some(key));
             defs.push(def);
         }
 
-        // a transition naming a state the matrix never defined leaves the agent with nothing to do,
-        // which this shared terminal state represents directly
-        let dormant = keys.len();
+        let dormant = StateId(keys.len());
         keys.push(None);
 
         let mut states: Vec<CompiledState<S>> = defs
@@ -156,8 +136,7 @@ where
                     WeightedIndex::new(&weights).ok()
                 };
 
-                // a mean that isn't positive and finite has no exponential to draw from, so the
-                // agent stops transitioning
+                // no rate, agent goes dormant
                 let delay = (def.event_rate.is_finite() && def.event_rate > 0.0)
                     .then(|| Exp::new(1.0 / def.event_rate).ok())
                     .flatten();
@@ -185,28 +164,31 @@ where
         }
     }
 
-    /// The table position for a state type, which is what [`SimAgent::step`] and
-    /// [`SimAgent::apply_transition`] deal in.
-    ///
-    /// Positions are assigned when the table is compiled and carry no meaning beyond that table, so
-    /// an agent that wants to steer itself to a particular state has to ask for the position rather
-    /// than assume one.
-    pub fn index(&self, key: &C) -> Option<usize> {
+    pub fn index(&self, key: &C) -> Option<StateId> {
         self.index_of.get(key).copied()
     }
 
-    /// The state type at `index`, or `None` for the dormant state.
-    pub fn state_type(&self, index: usize) -> Option<&C> {
-        self.keys.get(index).and_then(|key| key.as_ref())
+    pub fn state_type(&self, id: StateId) -> Option<&C> {
+        self.keys.get(id.0).and_then(|key| key.as_ref())
     }
 
-    /// The number of states in the table, excluding the dormant one.
+    pub fn dormant(&self) -> StateId {
+        StateId(self.states.len() - 1)
+    }
+
     pub fn len(&self) -> usize {
         self.states.len() - 1
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    // foreign ids read as dormant
+    fn state(&self, id: StateId) -> &CompiledState<S> {
+        self.states
+            .get(id.0)
+            .unwrap_or_else(|| &self.states[self.states.len() - 1])
     }
 }
 
@@ -216,7 +198,7 @@ where
     S: State,
 {
     transitions: Arc<Transitions<C, S>>,
-    current: usize,
+    current: StateId,
     pub data: S,
     pub id: AgentId,
 }
@@ -240,11 +222,7 @@ where
         )
     }
 
-    /// Builds an agent over a transition table shared with its peers.
-    ///
-    /// A population built through [`new`](Self::new) compiles and holds one table per agent, which
-    /// dominates memory once the population is large. Compiling once and handing every agent the
-    /// same [`Arc`] leaves each one carrying only its id and its own state.
+    /// Builds an agent over a shared table.
     pub fn with_shared_transitions(
         id: impl Into<AgentId>,
         initial_state_type: C,
@@ -254,7 +232,8 @@ where
         let current = transitions
             .index(&initial_state_type)
             .expect("Initial state type must exist in transition matrix");
-        let factory = transitions.states[current]
+        let factory = transitions
+            .state(current)
             .factory
             .as_ref()
             .expect("A defined state always has a factory");
@@ -268,13 +247,11 @@ where
         }
     }
 
-    /// The state type the agent currently occupies, or `None` once it has transitioned into a state
-    /// the matrix never defined and gone dormant.
+    /// Current state type, `None` if dormant.
     pub fn current_state_type(&self) -> Option<&C> {
         self.transitions.state_type(self.current)
     }
 
-    /// The compiled table behind this agent, for looking up the position of a state type.
     pub fn transitions(&self) -> &Transitions<C, S> {
         &self.transitions
     }
@@ -285,28 +262,28 @@ where
     C: Eq + Hash + Clone,
     S: State + Clone,
 {
-    type State = usize;
+    type State = StateId;
     type World = ();
 
-    // `now` is unused: a Markov agent's timing is memoryless.
+    // markov timing is memoryless
     fn peek_next_event_delay(
         &self,
         _now: DateTime<Utc>,
         _world: &(),
         rng: &mut dyn RngCore,
     ) -> Option<f64> {
-        Some(self.transitions.states[self.current].delay?.sample(rng))
+        Some(self.transitions.state(self.current).delay?.sample(rng))
     }
 
-    fn step(&self, _now: DateTime<Utc>, _world: &(), rng: &mut dyn RngCore) -> Option<usize> {
-        let state = &self.transitions.states[self.current];
+    fn step(&self, _now: DateTime<Utc>, _world: &(), rng: &mut dyn RngCore) -> Option<StateId> {
+        let state = self.transitions.state(self.current);
         let picker = state.picker.as_ref()?;
         Some(state.targets[picker.sample(rng)])
     }
 
     fn apply_transition(
         &mut self,
-        next: usize,
+        next: StateId,
         time: DateTime<Utc>,
         _world: &(),
         rng: &mut dyn RngCore,
@@ -314,7 +291,7 @@ where
     ) {
         self.current = next;
 
-        let Some(factory) = self.transitions.states[next].factory.as_ref() else {
+        let Some(factory) = self.transitions.state(next).factory.as_ref() else {
             return;
         };
 
@@ -437,7 +414,7 @@ mod tests {
         let delay = agent.peek_next_event_delay(Utc::now(), &(), &mut rng);
         assert!(delay.is_some_and(|d| d > 0.0));
 
-        // a zero event rate has no exponential to draw from, so the agent stops transitioning
+        // zero rate goes dormant
         agent.current = agent.transitions.index(&AgentState::Active).unwrap();
         assert!(
             agent
@@ -468,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_transition_appends_to_an_existing_buffer() {
+    fn test_apply_transition_appends() {
         let mut rng = StdRng::seed_from_u64(42);
         let time = Utc.timestamp_opt(1000, 0).unwrap();
 
@@ -490,13 +467,13 @@ mod tests {
     }
 
     #[test]
-    fn test_transition_to_an_undefined_state_goes_dormant() {
+    fn test_undefined_state_goes_dormant() {
         let mut rng = StdRng::seed_from_u64(42);
         let transitions = HashMap::from([(
             AgentState::Idle,
             StateType::new_deterministic(
                 || MockState { value: 0 },
-                // Active is never defined, so landing on it leaves the agent with nothing to do
+                // Active is never defined
                 vec![(AgentState::Active, 1.0)],
                 1.0,
             ),
@@ -518,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn test_positions_are_looked_up_rather_than_assumed() {
+    fn test_state_ids_come_from_the_table() {
         let mut rng = StdRng::seed_from_u64(3);
         let table = Arc::new(Transitions::compile(idle_and_active()));
 
@@ -529,15 +506,49 @@ mod tests {
         assert_eq!(table.len(), 2);
         assert_eq!(table.state_type(idle), Some(&AgentState::Idle));
         assert_eq!(table.state_type(active), Some(&AgentState::Active));
-        // the position past the defined states is the dormant one
-        assert_eq!(table.state_type(table.len()), None);
+        assert_eq!(table.state_type(table.dormant()), None);
 
         let agent = Agent::with_shared_transitions("a", AgentState::Idle, table, &mut rng);
         assert_eq!(agent.transitions().index(&AgentState::Active), Some(active));
     }
 
     #[test]
-    fn test_shared_transitions_are_not_duplicated_per_agent() {
+    fn test_foreign_state_id_goes_dormant() {
+        let mut rng = StdRng::seed_from_u64(3);
+
+        // wider table, foreign ids
+        let wide = Transitions::compile(HashMap::from([
+            (
+                AgentState::Idle,
+                StateType::new_deterministic(|| MockState { value: 0 }, vec![], 1.0),
+            ),
+            (
+                AgentState::Active,
+                StateType::new_deterministic(|| MockState { value: 1 }, vec![], 1.0),
+            ),
+        ]));
+        let stranger = wide.dormant();
+
+        let narrow = HashMap::from([(
+            AgentState::Idle,
+            StateType::new_deterministic(|| MockState { value: 0 }, vec![], 1.0),
+        )]);
+        let mut agent = Agent::new("a", AgentState::Idle, narrow, &mut rng);
+
+        let mut out = Vec::new();
+        agent.apply_transition(stranger, Utc::now(), &(), &mut rng, &mut out);
+
+        assert!(out.is_empty());
+        assert_eq!(agent.current_state_type(), None);
+        assert!(
+            agent
+                .peek_next_event_delay(Utc::now(), &(), &mut rng)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_shared_transitions_not_duplicated() {
         let shared = Arc::new(Transitions::compile(idle_and_active()));
         let mut rng = StdRng::seed_from_u64(1);
 
@@ -553,12 +564,11 @@ mod tests {
             .collect();
 
         assert_eq!(agents.len(), 8);
-        // one table behind the population plus the handle held here
         assert_eq!(Arc::strong_count(&shared), 9);
     }
 
     #[test]
-    fn test_shared_transitions_match_owned_transitions() {
+    fn test_shared_matches_owned() {
         let time = Utc.timestamp_opt(1000, 0).unwrap();
 
         let mut owned_rng = StdRng::seed_from_u64(42);

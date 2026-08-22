@@ -1,20 +1,7 @@
-//! The pending-event queue.
-//!
-//! A simulation pushes and pops this once per event, so its shape is a large part of the cost of
-//! running one. It is a 4-ary min-heap rather than the binary heap in the standard library: four
-//! children sit in a single cache line, and the tree is half as deep, which is what matters once a
-//! population is too large for the queue to stay in cache.
-
 use std::cmp::Ordering;
 
-/// How many children each node has. Four 24-byte entries span one 64-byte cache line closely
-/// enough that a sift step touches one line instead of two.
 const ARITY: usize = 4;
 
-/// A transition waiting to happen.
-///
-/// The state is stored directly rather than behind an `Option`, since nothing is ever queued
-/// without one, and the agent is a `u32`, which keeps the whole entry inside three words.
 pub(crate) struct ScheduledEvent<C> {
     pub time_ms: i64,
     pub agent_index: u32,
@@ -22,7 +9,6 @@ pub(crate) struct ScheduledEvent<C> {
 }
 
 impl<C> ScheduledEvent<C> {
-    /// Earliest first, ties broken by agent so that simultaneous events keep a stable order.
     fn before(&self, other: &Self) -> bool {
         match self.time_ms.cmp(&other.time_ms) {
             Ordering::Less => true,
@@ -54,7 +40,6 @@ impl<C> EventQueue<C> {
             return Some(last);
         }
 
-        // the tail takes the root's place and sinks to where it belongs
         let root = std::mem::replace(&mut self.items[0], last);
         self.sift_down(0);
         Some(root)
@@ -127,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simultaneous_events_order_by_agent() {
+    fn test_ties_order_by_agent() {
         let mut queue = EventQueue::with_capacity(0);
         for agent in [4, 1, 3, 0, 2] {
             queue.push(event(100, agent));
@@ -148,11 +133,10 @@ mod tests {
     }
 
     #[test]
-    fn test_interleaved_pushes_and_pops_stay_ordered() {
+    fn test_interleaved_push_pop() {
         let mut queue = EventQueue::with_capacity(0);
         let mut expected = Vec::new();
 
-        // a spread wide enough to exercise several levels of the tree in both directions
         let mut value: i64 = 1;
         for round in 0..200i64 {
             value = (value * 48271) % 65537;
@@ -172,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matches_a_sorted_reference_under_many_entries() {
+    fn test_matches_sorted_reference() {
         let mut queue = EventQueue::with_capacity(0);
         let mut reference = Vec::new();
 

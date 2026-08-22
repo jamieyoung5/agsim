@@ -3,17 +3,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-// how long a live run sleeps in one go while waiting for the next event
+// max sleep between stop checks
 pub(crate) const STOP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 
-/// Source of wall-clock time for a live run. Implement it to pace against something other than
-/// the system clock.
+/// Wall-clock source for a live run.
 pub trait Clock {
     fn now(&self) -> Instant;
     fn sleep(&self, duration: StdDuration);
 }
 
-/// A [`Clock`] backed by the monotonic system clock.
+/// Monotonic system clock.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -27,7 +26,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Ends a live run. Clone it into a Ctrl-C handler or control thread.
+/// Ends a live run.
 #[derive(Debug, Clone, Default)]
 pub struct StopSignal(Arc<AtomicBool>);
 
@@ -45,7 +44,7 @@ impl StopSignal {
     }
 }
 
-/// Pacing configuration for [`Simulation::run_live`](crate::simulation::Simulation::run_live).
+/// Pacing for [`Simulation::run_live`](crate::simulation::Simulation::run_live).
 #[derive(Debug, Clone)]
 pub struct Live {
     speed: f64,
@@ -110,7 +109,7 @@ pub enum LiveOutcome {
     Stopped,
     /// The callback returned [`ControlFlow::Break`](std::ops::ControlFlow::Break).
     Halted,
-    /// The configured simulated-time horizon was passed.
+    /// The horizon was passed.
     HorizonReached,
     /// No agent has anything left to do.
     Drained,

@@ -4,16 +4,6 @@ use rand::rngs::StdRng;
 
 const PHI: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// The generator behind each agent's substream.
-///
-/// A simulation holds one of these per agent and touches them in event order, so the array of them
-/// is walked randomly and its size shows up directly as cache misses. This is SplitMix64: a single
-/// word of state against the 32 bytes of xoshiro256++ and the 136 of [`StdRng`], emitting 64 bits
-/// per call. The algorithm is pinned here rather than taken from a dependency so a seed keeps
-/// replaying the same run across upgrades.
-///
-/// Its period is 2^64 per agent. That is far short of xoshiro's 2^256 but still leaves room for
-/// 10^19 draws on a single substream, which no run this is built for will approach.
 #[derive(Debug, Clone)]
 pub struct SimRng {
     state: u64,
@@ -62,8 +52,7 @@ pub fn substream(seed: u64, index: u64) -> SimRng {
     SimRng::seed_from_u64(derive(seed, index))
 }
 
-/// [`substream`]'s seed without the generator, for handing to something that seeds itself, such as
-/// sampling in a local model.
+/// [`substream`]'s seed without the generator.
 pub fn derive(seed: u64, index: u64) -> u64 {
     splitmix64(seed ^ splitmix64(index))
 }
@@ -110,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn test_output_does_not_get_stuck() {
+    fn test_output_varies() {
         let values = draw(substream(0, 0));
         assert!(values.iter().any(|&v| v != 0));
         assert_eq!(
@@ -123,21 +112,20 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_bytes_handles_a_partial_tail() {
+    fn test_fill_bytes_partial_tail() {
         let mut rng = substream(9, 1);
         let mut buffer = [0u8; 13];
         rng.fill_bytes(&mut buffer);
 
         assert!(buffer.iter().any(|&b| b != 0));
 
-        // the same seed fills the same bytes, tail included
         let mut again = [0u8; 13];
         substream(9, 1).fill_bytes(&mut again);
         assert_eq!(buffer, again);
     }
 
     #[test]
-    fn test_state_is_one_word() {
+    fn test_state_fits_one_word() {
         assert_eq!(std::mem::size_of::<SimRng>(), 8);
         assert!(std::mem::size_of::<SimRng>() < std::mem::size_of::<StdRng>());
     }

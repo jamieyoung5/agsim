@@ -1,15 +1,6 @@
-//! Capacity model for a market simulation: measured throughput, projected to a decade.
-//!
-//! Traders here use the architecture a market actually wants — they write to a shared tape and read
-//! it back when they decide, rather than being individually notified of every other trader's
-//! activity. That keeps shared context O(1) per event instead of O(agents).
-//!
-//! Each configuration runs a short window of market time and the result is extrapolated, since the
-//! whole point is that the full run does not fit in a benchmark. The consumer side is measured too:
-//! events are folded into one-minute bars, because at these rates whatever reads the events is a
-//! real part of the cost.
+// shared-world throughput and projection
 
-use agsim::agent::{Agent, SimAgent, StateType, Transitions};
+use agsim::agent::{Agent, SimAgent, StateId, StateType, Transitions};
 use agsim::simulation::Simulation;
 use agsim::state::{StateChangeEvent, Value};
 use agsim::world::World;
@@ -21,49 +12,48 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-const TRADING_DAYS_PER_YEAR: f64 = 252.0;
-const TRADING_HOURS_PER_DAY: f64 = 6.5;
+const DAYS_PER_YEAR: f64 = 365.0;
 const YEARS: f64 = 10.0;
 
-/// Default minutes of market time each measured window covers.
+/// Minutes of simulated time per window.
 const DEFAULT_WINDOW_MINUTES: i64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-enum TraderMode {
-    Flat,
-    Bidding,
-    Offering,
-    Holding,
+enum Mode {
+    Idle,
+    Active,
+    Busy,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Default, State, StateDisplay)]
-struct TraderState {
-    position: i64,
-    working_orders: u32,
-    quote_price: i64,
-    exposure: i64,
+struct Metrics {
+    level: i64,
+    pending: u32,
+    signal: i64,
+    total: i64,
 }
 
-/// The shared view every trader reads: where the last print landed and how busy the tape is.
+/// Shared view every agent reads.
 #[derive(Default)]
-struct Tape {
-    last_price: i64,
-    prints: u64,
-    volume: i64,
+struct Shared {
+    last_signal: i64,
+    updates: u64,
+    total: i64,
 }
 
-impl World for Tape {
+impl World for Shared {
     fn absorb(&mut self, event: &StateChangeEvent) {
         match event.field.as_ref() {
-            "quote_price" => {
-                if let Value::Int(price) = event.new_value {
-                    self.last_price = price;
-                    self.prints += 1;
+            "signal" => {
+                if let Value::Int(signal) = event.new_value {
+                    self.last_signal = signal;
+                    self.updates += 1;
                 }
             }
-            "position" => {
-                if let Value::Int(size) = event.new_value {
-                    self.volume += size.abs();
+            "level" => {
+                if let Value::Int(level) = event.new_value {
+                    self.total += level.abs();
                 }
             }
             _ => {}
@@ -71,74 +61,74 @@ impl World for Tape {
     }
 }
 
-/// A trader whose next move depends on where the tape is relative to its own last quote.
-struct Trader {
-    inner: Agent<TraderMode, TraderState>,
+/// An agent that reads the world.
+struct SharedAgent {
+    inner: Agent<Mode, Metrics>,
     reference: i64,
-    flat: usize,
+    idle: StateId,
 }
 
-impl SimAgent for Trader {
-    type State = usize;
-    type World = Tape;
+impl SimAgent for SharedAgent {
+    type State = StateId;
+    type World = Shared;
 
     fn peek_next_event_delay(
         &self,
         now: DateTime<Utc>,
-        _world: &Tape,
+        _world: &Shared,
         rng: &mut dyn RngCore,
     ) -> Option<f64> {
         self.inner.peek_next_event_delay(now, &(), rng)
     }
 
-    fn step(&self, now: DateTime<Utc>, world: &Tape, rng: &mut dyn RngCore) -> Option<usize> {
+    fn step(&self, now: DateTime<Utc>, world: &Shared, rng: &mut dyn RngCore) -> Option<StateId> {
         let intended = self.inner.step(now, &(), rng)?;
 
-        // a trader that finds the tape below its own reference stands down instead
-        if world.last_price >= self.reference {
+        // below reference, go idle
+        if world.last_signal >= self.reference {
             Some(intended)
         } else {
-            Some(self.flat)
+            Some(self.idle)
         }
     }
 
     fn apply_transition(
         &mut self,
-        next: usize,
+        next: StateId,
         time: DateTime<Utc>,
-        world: &Tape,
+        world: &Shared,
         rng: &mut dyn RngCore,
         out: &mut Vec<StateChangeEvent>,
     ) {
-        self.reference = world.last_price;
+        self.reference = world.last_signal;
         self.inner.apply_transition(next, time, &(), rng, out);
     }
 }
 
-fn transitions() -> HashMap<TraderMode, StateType<TraderMode, TraderState>> {
+fn transitions() -> HashMap<Mode, StateType<Mode, Metrics>> {
     let mut matrix = HashMap::new();
     let modes = [
-        (TraderMode::Flat, 45.0),
-        (TraderMode::Bidding, 20.0),
-        (TraderMode::Offering, 20.0),
-        (TraderMode::Holding, 90.0),
+        (Mode::Idle, 45.0),
+        (Mode::Active, 20.0),
+        (Mode::Busy, 20.0),
+        (Mode::Blocked, 90.0),
     ];
 
     for (mode, rate) in modes {
         matrix.insert(
             mode,
             StateType::new(
-                |rng| TraderState {
-                    position: rng.gen_range(-800..800),
-                    working_orders: rng.gen_range(0..8),
-                    quote_price: rng.gen_range(9_000..11_000),
-                    exposure: rng.gen_range(0..400_000),
+                |rng| Metrics {
+                    level: rng.gen_range(-800..800),
+                    pending: rng.gen_range(0..8),
+                    signal: rng.gen_range(9_000..11_000),
+                    total: rng.gen_range(0..400_000),
                 },
                 vec![
-                    (TraderMode::Flat, 0.25),
-                    (TraderMode::Bidding, 0.25),
-                    (TraderMode::Offering, 0.25),
-                    (TraderMode::Holding, 0.25),
+                    (Mode::Idle, 0.25),
+                    (Mode::Active, 0.25),
+                    (Mode::Busy, 0.25),
+                    (Mode::Blocked, 0.25),
                 ],
                 rate,
             ),
@@ -148,23 +138,23 @@ fn transitions() -> HashMap<TraderMode, StateType<TraderMode, TraderState>> {
     matrix
 }
 
-/// One-minute OHLC bars, standing in for whatever a real run would do with the flow.
+/// One-minute min/max windows.
 #[derive(Default)]
-struct Bars {
+struct Window {
     current_minute: i64,
-    open: i64,
-    high: i64,
-    low: i64,
-    close: i64,
+    first: i64,
+    max: i64,
+    min: i64,
+    last: i64,
     completed: u64,
 }
 
-impl Bars {
+impl Window {
     fn fold(&mut self, event: &StateChangeEvent) {
-        let Value::Int(price) = event.new_value else {
+        let Value::Int(signal) = event.new_value else {
             return;
         };
-        if event.field != "quote_price" {
+        if event.field != "signal" {
             return;
         }
 
@@ -172,17 +162,17 @@ impl Bars {
         if minute != self.current_minute {
             self.completed += 1;
             self.current_minute = minute;
-            self.open = price;
-            self.high = price;
-            self.low = price;
+            self.first = signal;
+            self.max = signal;
+            self.min = signal;
         }
-        self.high = self.high.max(price);
-        self.low = self.low.min(price);
-        self.close = price;
+        self.max = self.max.max(signal);
+        self.min = self.min.min(signal);
+        self.last = signal;
     }
 }
 
-/// FNV-1a over the whole event stream, for checking that a seed reproduces a run.
+/// FNV-1a over the event stream.
 #[derive(Default)]
 struct Digest(u64);
 
@@ -218,32 +208,32 @@ fn measure(agents_count: usize, aggregate: bool, window_minutes: i64) -> Measure
     let shared = Arc::new(Transitions::compile(transitions()));
     let mut rng = StdRng::seed_from_u64(4);
 
-    let agents: Vec<Trader> = (0..agents_count)
+    let agents: Vec<SharedAgent> = (0..agents_count)
         .map(|index| {
             let inner = Agent::with_shared_transitions(
-                format!("trader_{index:07}"),
-                TraderMode::Flat,
+                format!("agent_{index:07}"),
+                Mode::Idle,
                 Arc::clone(&shared),
                 &mut rng,
             );
-            // compiled positions follow the table, not the order the modes were written in
-            let flat = inner
+            // ids come from the table
+            let idle = inner
                 .transitions()
-                .index(&TraderMode::Flat)
-                .expect("Flat is a defined mode");
-            Trader {
+                .index(&Mode::Idle)
+                .expect("Idle is a defined mode");
+            SharedAgent {
                 inner,
                 reference: 10_000,
-                flat,
+                idle,
             }
         })
         .collect();
 
     let start = Utc.with_ymd_and_hms(2026, 1, 5, 14, 30, 0).unwrap();
-    let mut sim = Simulation::with_world(agents, start, 4, Tape::default());
+    let mut sim = Simulation::with_world(agents, start, 4, Shared::default());
 
     let mut events: u64 = 0;
-    let mut bars = Bars::default();
+    let mut window = Window::default();
     let mut digest = Digest::new();
 
     let clock = Instant::now();
@@ -251,14 +241,14 @@ fn measure(agents_count: usize, aggregate: bool, window_minutes: i64) -> Measure
         events += 1;
         digest.absorb(&event);
         if aggregate {
-            bars.fold(&event);
+            window.fold(&event);
         }
     });
     let run_sec = clock.elapsed().as_secs_f64();
 
-    // keep the aggregate observable so it cannot be optimised away
-    if bars.completed == u64::MAX {
-        println!("unreachable {}", bars.close);
+    // defeat dead code elimination
+    if window.completed == u64::MAX {
+        println!("unreachable {}", window.last);
     }
 
     Measurement {
@@ -269,35 +259,31 @@ fn measure(agents_count: usize, aggregate: bool, window_minutes: i64) -> Measure
     }
 }
 
-/// Writes the event stream as four separate columns of fixed-width values.
-///
-/// Grouping like with like is what makes the stream compressible: timestamps become small deltas,
-/// agent indices and field names repeat heavily, and prices move in narrow ranges. Interleaving
-/// them as whole records, the way a row of CSV does, hides all of that from the compressor.
+/// Writes the event stream as columns.
 fn dump_columns(path: &str, agents_count: usize, window_minutes: i64) {
     use std::io::Write;
 
     let shared = Arc::new(Transitions::compile(transitions()));
     let mut rng = StdRng::seed_from_u64(4);
-    let agents: Vec<Trader> = (0..agents_count)
+    let agents: Vec<SharedAgent> = (0..agents_count)
         .map(|index| {
             let inner = Agent::with_shared_transitions(
-                format!("trader_{index:07}"),
-                TraderMode::Flat,
+                format!("agent_{index:07}"),
+                Mode::Idle,
                 Arc::clone(&shared),
                 &mut rng,
             );
-            let flat = inner.transitions().index(&TraderMode::Flat).unwrap();
-            Trader {
+            let idle = inner.transitions().index(&Mode::Idle).unwrap();
+            SharedAgent {
                 inner,
                 reference: 10_000,
-                flat,
+                idle,
             }
         })
         .collect();
 
     let start = Utc.with_ymd_and_hms(2026, 1, 5, 14, 30, 0).unwrap();
-    let mut sim = Simulation::with_world(agents, start, 4, Tape::default());
+    let mut sim = Simulation::with_world(agents, start, 4, Shared::default());
 
     let mut times: Vec<i32> = Vec::new();
     let mut ids: Vec<u32> = Vec::new();
@@ -318,9 +304,9 @@ fn dump_columns(path: &str, agents_count: usize, window_minutes: i64) {
             .unwrap_or(0);
         ids.push(id);
         fields.push(match event.field.as_ref() {
-            "position" => 0,
-            "working_orders" => 1,
-            "quote_price" => 2,
+            "level" => 0,
+            "pending" => 1,
+            "signal" => 2,
             _ => 3,
         });
         values.push(event.new_value.as_i64().unwrap_or(0));
@@ -376,42 +362,43 @@ fn format_bytes(bytes: f64) -> String {
 }
 
 fn main() {
-    let aggregate = !std::env::args().any(|arg| arg == "--no-aggregate");
-    let window_minutes: i64 = std::env::args()
-        .position(|a| a == "--window")
-        .and_then(|at| std::env::args().nth(at + 1))
+    let args = self::args();
+    let after = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|at| args.get(at + 1))
+    };
+
+    let aggregate = !args.iter().any(|arg| arg == "--no-aggregate");
+    let window_minutes: i64 = after("--window")
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(DEFAULT_WINDOW_MINUTES);
-    let counts: Vec<usize> = match std::env::args().position(|a| a == "--agents") {
-        Some(at) => std::env::args()
-            .nth(at + 1)
-            .expect("--agents needs a list")
+    let counts: Vec<usize> = match after("--agents") {
+        Some(list) => list
             .split(',')
             .map(|part| part.trim().parse().expect("agent counts are numbers"))
             .collect(),
         None => vec![1_000, 10_000, 100_000, 1_000_000],
     };
 
-    if let Some(at) = std::env::args().position(|a| a == "--dump") {
-        let path = std::env::args().nth(at + 1).expect("--dump needs a path");
+    if let Some(path) = after("--dump") {
         let count = counts.first().copied().unwrap_or(2000);
-        dump_columns(&path, count, window_minutes);
+        dump_columns(path, count, window_minutes);
         return;
     }
 
-    // market seconds in a decade of trading sessions
-    let decade_seconds = YEARS * TRADING_DAYS_PER_YEAR * TRADING_HOURS_PER_DAY * 3600.0;
+    let horizon_seconds = YEARS * DAYS_PER_YEAR * 86_400.0;
     let window_seconds = (window_minutes * 60) as f64;
-    let scale = decade_seconds / window_seconds;
+    let scale = horizon_seconds / window_seconds;
 
     println!(
-        "10 years = {TRADING_DAYS_PER_YEAR:.0} sessions/yr x {TRADING_HOURS_PER_DAY} h = {:.0}M market seconds",
-        decade_seconds / 1e6
+        "{YEARS:.0} years = {:.0}M simulated seconds",
+        horizon_seconds / 1e6
     );
     println!(
-        "measured over {window_minutes} market minutes, consumer = {}\n",
+        "measured over {window_minutes} simulated minutes, consumer = {}\n",
         if aggregate {
-            "1-minute OHLC bars"
+            "1-minute windows"
         } else {
             "count only"
         }
@@ -419,11 +406,11 @@ fn main() {
 
     println!(
         "{:>10} | {:>13} | {:>10} | {:>9} | {:>14} | {:>12} | {:>11}",
-        "agents", "events/s", "ns/event", "peak MB", "decade events", "decade CPU", "if retained"
+        "agents", "events/s", "ns/event", "peak MB", "horizon events", "horizon CPU", "if retained"
     );
     println!("{}", "-".repeat(100));
 
-    let show_digest = std::env::args().any(|arg| arg == "--digest");
+    let show_digest = args.iter().any(|arg| arg == "--digest");
 
     for count in counts {
         let m = measure(count, aggregate, window_minutes);
@@ -435,7 +422,7 @@ fn main() {
             continue;
         }
         let rate = m.events as f64 / m.run_sec;
-        let decade_events = m.events as f64 * scale;
+        let horizon_events = m.events as f64 * scale;
 
         println!(
             "{:>10} | {:>13.0} | {:>10.0} | {:>9.1} | {:>14} | {:>12} | {:>11}",
@@ -443,11 +430,19 @@ fn main() {
             rate,
             m.run_sec * 1e9 / m.events as f64,
             m.peak_mb,
-            format!("{:.2e}", decade_events),
-            format_duration(decade_events / rate),
-            format_bytes(decade_events * 100.0),
+            format!("{:.2e}", horizon_events),
+            format_duration(horizon_events / rate),
+            format_bytes(horizon_events * 100.0),
         );
     }
 
-    println!("\n'if retained' assumes ~100 bytes per event, the measured cost of a kept log.");
+    println!("\n'if retained' assumes ~100 bytes per event.");
+}
+
+// cargo bench passes --bench
+fn args() -> Vec<String> {
+    std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .collect()
 }

@@ -1,13 +1,6 @@
-//! Scaling harness: how many agents can a simulation carry before throughput collapses?
-//!
-//! Runs one configuration and prints a single result row. `--sweep` re-executes this example as a
-//! fresh subprocess per agent count, which keeps the peak-RSS figure honest — a high-water mark
-//! never falls, so several configurations in one process would all report the largest one.
-//!
-//! The agent is shaped like a market participant (quote, position, order book pressure) so the
-//! numbers transfer to an order-flow simulation rather than to a toy two-state agent.
+// agent-count scaling harness
 
-use agsim::agent::{Agent, SimAgent, StateType, Transitions};
+use agsim::agent::{Agent, SimAgent, StateId, StateType, Transitions};
 use agsim::clock::{Live, LiveOutcome};
 use agsim::simulation::{Perception, Simulation};
 use agsim::space::Position;
@@ -22,91 +15,87 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-enum TraderMode {
-    Flat,
-    Bidding,
-    Offering,
-    Holding,
+enum Mode {
+    Idle,
+    Active,
+    Busy,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Default, State, StateDisplay)]
-struct TraderState {
-    position: i64,
-    working_orders: u32,
-    quote_price: i64,
-    exposure: i64,
+struct Metrics {
+    level: i64,
+    pending: u32,
+    signal: i64,
+    total: i64,
 }
 
-fn transitions() -> HashMap<TraderMode, StateType<TraderMode, TraderState>> {
+fn transitions() -> HashMap<Mode, StateType<Mode, Metrics>> {
     let mut matrix = HashMap::new();
 
     matrix.insert(
-        TraderMode::Flat,
+        Mode::Idle,
         StateType::new(
-            |rng| TraderState {
-                position: 0,
-                working_orders: 0,
-                quote_price: rng.gen_range(9_000..11_000),
-                exposure: 0,
+            |rng| Metrics {
+                level: 0,
+                pending: 0,
+                signal: rng.gen_range(9_000..11_000),
+                total: 0,
             },
-            vec![
-                (TraderMode::Bidding, 0.45),
-                (TraderMode::Offering, 0.45),
-                (TraderMode::Flat, 0.10),
-            ],
+            vec![(Mode::Active, 0.45), (Mode::Busy, 0.45), (Mode::Idle, 0.10)],
             45.0,
         ),
     );
 
     matrix.insert(
-        TraderMode::Bidding,
+        Mode::Active,
         StateType::new(
-            |rng| TraderState {
-                position: rng.gen_range(1..500),
-                working_orders: rng.gen_range(1..8),
-                quote_price: rng.gen_range(9_000..11_000),
-                exposure: rng.gen_range(1_000..250_000),
+            |rng| Metrics {
+                level: rng.gen_range(1..500),
+                pending: rng.gen_range(1..8),
+                signal: rng.gen_range(9_000..11_000),
+                total: rng.gen_range(1_000..250_000),
             },
             vec![
-                (TraderMode::Holding, 0.50),
-                (TraderMode::Offering, 0.30),
-                (TraderMode::Flat, 0.20),
+                (Mode::Blocked, 0.50),
+                (Mode::Busy, 0.30),
+                (Mode::Idle, 0.20),
             ],
             20.0,
         ),
     );
 
     matrix.insert(
-        TraderMode::Offering,
+        Mode::Busy,
         StateType::new(
-            |rng| TraderState {
-                position: rng.gen_range(-500..0),
-                working_orders: rng.gen_range(1..8),
-                quote_price: rng.gen_range(9_000..11_000),
-                exposure: rng.gen_range(1_000..250_000),
+            |rng| Metrics {
+                level: rng.gen_range(-500..0),
+                pending: rng.gen_range(1..8),
+                signal: rng.gen_range(9_000..11_000),
+                total: rng.gen_range(1_000..250_000),
             },
             vec![
-                (TraderMode::Holding, 0.50),
-                (TraderMode::Bidding, 0.30),
-                (TraderMode::Flat, 0.20),
+                (Mode::Blocked, 0.50),
+                (Mode::Active, 0.30),
+                (Mode::Idle, 0.20),
             ],
             20.0,
         ),
     );
 
     matrix.insert(
-        TraderMode::Holding,
+        Mode::Blocked,
         StateType::new(
-            |rng| TraderState {
-                position: rng.gen_range(-800..800),
-                working_orders: rng.gen_range(0..3),
-                quote_price: rng.gen_range(9_000..11_000),
-                exposure: rng.gen_range(0..400_000),
+            |rng| Metrics {
+                level: rng.gen_range(-800..800),
+                pending: rng.gen_range(0..3),
+                signal: rng.gen_range(9_000..11_000),
+                total: rng.gen_range(0..400_000),
             },
             vec![
-                (TraderMode::Bidding, 0.35),
-                (TraderMode::Offering, 0.35),
-                (TraderMode::Holding, 0.30),
+                (Mode::Active, 0.35),
+                (Mode::Busy, 0.35),
+                (Mode::Blocked, 0.30),
             ],
             90.0,
         ),
@@ -115,30 +104,27 @@ fn transitions() -> HashMap<TraderMode, StateType<TraderMode, TraderState>> {
     matrix
 }
 
-/// A trader that actually consumes the tape. The plain [`Agent`] leaves `observe` at its no-op
-/// default, which lets the optimiser delete the simulation's observer loop outright; anything that
-/// reacts to other agents pays for that loop in full, so the harness needs both shapes to tell the
-/// framework's cost from the optimiser's luck.
-struct ObservingTrader {
-    inner: Agent<TraderMode, TraderState>,
+/// An agent that consumes events.
+struct ObservingAgent {
+    inner: Agent<Mode, Metrics>,
     seen: u64,
-    last_price: i64,
-    position: Position,
+    last_signal: i64,
+    at: Position,
 }
 
-impl ObservingTrader {
-    fn new(inner: Agent<TraderMode, TraderState>, position: Position) -> Self {
-        ObservingTrader {
+impl ObservingAgent {
+    fn new(inner: Agent<Mode, Metrics>, at: Position) -> Self {
+        ObservingAgent {
             inner,
             seen: 0,
-            last_price: 0,
-            position,
+            last_signal: 0,
+            at,
         }
     }
 }
 
-impl SimAgent for ObservingTrader {
-    type State = usize;
+impl SimAgent for ObservingAgent {
+    type State = StateId;
     type World = ();
 
     fn peek_next_event_delay(
@@ -150,13 +136,13 @@ impl SimAgent for ObservingTrader {
         self.inner.peek_next_event_delay(now, world, rng)
     }
 
-    fn step(&self, now: DateTime<Utc>, world: &(), rng: &mut dyn RngCore) -> Option<usize> {
+    fn step(&self, now: DateTime<Utc>, world: &(), rng: &mut dyn RngCore) -> Option<StateId> {
         self.inner.step(now, world, rng)
     }
 
     fn apply_transition(
         &mut self,
-        next: usize,
+        next: StateId,
         time: DateTime<Utc>,
         world: &(),
         rng: &mut dyn RngCore,
@@ -165,18 +151,17 @@ impl SimAgent for ObservingTrader {
         self.inner.apply_transition(next, time, world, rng, out)
     }
 
-    // deliberately the cheapest useful reaction: track the last quote off the tape
     fn observe(&mut self, event: &StateChangeEvent) {
         self.seen += 1;
-        if event.field == "quote_price"
-            && let Value::Int(price) = event.new_value
+        if event.field == "signal"
+            && let Value::Int(signal) = event.new_value
         {
-            self.last_price = price;
+            self.last_signal = signal;
         }
     }
 
     fn location(&self) -> Option<Position> {
-        Some(self.position)
+        Some(self.at)
     }
 }
 
@@ -206,7 +191,7 @@ fn start_time() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 5, 14, 30, 0).unwrap()
 }
 
-// current and peak resident set, in mebibytes
+// current and peak rss, mib
 fn memory_mb() -> (f64, f64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let field = |key: &str| -> f64 {
@@ -238,26 +223,20 @@ fn run_once(config: &Config) -> Outcome {
     let mut base = Vec::with_capacity(config.agents);
     let shared_matrix = Arc::new(Transitions::compile(matrix));
     for index in 0..config.agents {
-        let id = format!("trader_{index:07}");
+        let id = format!("agent_{index:07}");
         base.push(if config.shared {
-            Agent::with_shared_transitions(
-                id,
-                TraderMode::Flat,
-                Arc::clone(&shared_matrix),
-                &mut rng,
-            )
+            Agent::with_shared_transitions(id, Mode::Idle, Arc::clone(&shared_matrix), &mut rng)
         } else {
-            // the unshared path compiles its own copy of the table, which is the cost being measured
-            Agent::new(id, TraderMode::Flat, transitions(), &mut rng)
+            Agent::new(id, Mode::Idle, transitions(), &mut rng)
         });
     }
 
     if config.observing {
-        // agents are laid out on a line so a proximity radius selects a predictable neighbourhood
+        // laid out on a line
         let agents: Vec<_> = base
             .into_iter()
             .enumerate()
-            .map(|(index, agent)| ObservingTrader::new(agent, Position::new(index as f64, 0.0)))
+            .map(|(index, agent)| ObservingAgent::new(agent, Position::new(index as f64, 0.0)))
             .collect();
         let build_sec = build_start.elapsed().as_secs_f64();
         drive(config, agents, build_sec)
@@ -280,18 +259,13 @@ where
     let run_start = Instant::now();
 
     let (events, aborted) = if config.collect {
-        // the same retained log as `run`, but accumulated once by the caller, so the difference
-        // against --keep-log is exactly what `run`'s clone-on-return costs
         let mut log = Vec::new();
         sim.run_streaming(horizon, |event| log.push(event));
         (log.len() as u64, false)
     } else if config.retain_log {
-        // the accumulating path: every event is kept, then the whole log is cloned on return
         let log = sim.run(horizon);
         (log.len() as u64, false)
     } else {
-        // unpaced live pacing is the streaming path plus an abort hatch, so a configuration that
-        // is too slow reports a partial result instead of running until the user gives up
         let live = Live::unpaced().until(horizon);
         let mut events: u64 = 0;
         let outcome = sim.run_live(live, |_| {
@@ -385,7 +359,7 @@ fn parse_args() -> (Config, Option<Vec<usize>>) {
     let mut seed = 7u64;
     let mut sweep = None;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = self::args();
     let value = |index: usize| -> String {
         args.get(index + 1)
             .unwrap_or_else(|| panic!("{} needs a value", args[index]))
@@ -463,7 +437,7 @@ fn parse_args() -> (Config, Option<Vec<usize>>) {
     )
 }
 
-// re-runs this example once per agent count so each measurement gets a clean address space
+// fresh process per agent count
 fn sweep(config: &Config, counts: &[usize]) {
     let exe = std::env::current_exe().expect("current exe");
     header();
@@ -512,4 +486,12 @@ fn main() {
             report(&config, &outcome);
         }
     }
+}
+
+// cargo bench passes --bench
+fn args() -> Vec<String> {
+    std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .collect()
 }

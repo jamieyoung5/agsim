@@ -11,15 +11,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokenizers::Tokenizer;
 
-/// Wraps the prompt the way the model was tuned to expect.
+/// Prompt template for a model family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatTemplate {
     /// Llama 3 and its derivatives.
     #[default]
     Llama3,
-    /// ChatML: Qwen, Hermes, and most fine-tunes that aren't Llama.
+    /// ChatML: Qwen, Hermes, most non-Llama.
     ChatMl,
-    /// No template; system and user text run together, for base models.
+    /// No template, for base models.
     Plain,
 }
 

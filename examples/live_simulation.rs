@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::time::Instant;
 
-const SPEED: f64 = 1800.0; // simulated seconds per real second.
+const SPEED: f64 = 1800.0; // simulated seconds per real second
 const MAX_EVENTS: usize = 25;
 const WALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -37,7 +37,7 @@ fn transitions() -> HashMap<Mode, StateType<Mode, DeviceState>> {
                 cpu_in_use_percent: rng.gen_range(0.1..5.0),
             },
             vec![(Mode::Working, 0.7), (Mode::Idle, 0.3)],
-            45.0 * 60.0, // a transition every 45 simulated minutes on average.
+            45.0 * 60.0, // ~45 simulated minutes
         ),
     );
     transitions.insert(

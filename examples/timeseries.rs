@@ -132,8 +132,7 @@ fn sparkline(values: &[f32]) -> String {
 }
 
 fn main() {
-    // starting on a midnight boundary, with every generator seeded, so each run draws the same
-    // week of telemetry, and the sparklines below line up with the day they describe.
+    // seeded, so every run matches
     let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
     let mut setup_rng = StdRng::seed_from_u64(1);
@@ -146,12 +145,11 @@ fn main() {
         start,
         &mut setup_rng,
     );
-    agent.memory.reflection_threshold = f64::INFINITY; // no reflection in this example.
+    agent.memory.reflection_threshold = f64::INFINITY; // no reflection in this example
 
     let mut sim = Simulation::new_with_seed(vec![agent], start, 42);
     let events = sim.run(Duration::days(DAYS as i64));
 
-    // reconstruct the device's CPU timeline, sample it on a fixed grid, and add sensor noise.
     let timelines = Timeline::generate(&events);
     let timeline = timelines.get("device_000").expect("device timeline");
     let points: Vec<(DateTime<Utc>, f32)> = timeline

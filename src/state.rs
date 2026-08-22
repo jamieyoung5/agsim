@@ -5,40 +5,25 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-/// An agent's identity as it travels on events.
-///
-/// Every emitted change carries the id of the agent that produced it, so this is cloned far more
-/// often than it is created. Sharing one allocation between all of an agent's events keeps that
-/// clone to a reference count bump.
 pub type AgentId = Arc<str>;
 
-/// A field's value at a point in time.
-///
-/// State fields are overwhelmingly numbers and flags, and rendering those to text on every change
-/// costs an allocation and a formatting pass for a string most runs never read. Keeping the value
-/// in its own shape defers that to whoever actually displays or serializes it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum Value {
     Int(i64),
-    Uint(u64),
     Float(f64),
     Bool(bool),
     Text(Arc<str>),
 }
 
 impl Value {
-    /// Renders any [`Display`](fmt::Display) type into a [`Value::Text`], for state fields that are
-    /// not one of the primitive shapes.
     pub fn text(value: impl fmt::Display) -> Self {
         Value::Text(Arc::from(value.to_string().as_str()))
     }
 
-    /// The value as a number, whatever numeric shape it was stored in. `None` for text and flags.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(v) => Some(*v as f64),
-            Value::Uint(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
             Value::Bool(_) | Value::Text(_) => None,
         }
@@ -47,7 +32,6 @@ impl Value {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int(v) => Some(*v),
-            Value::Uint(v) => i64::try_from(*v).ok(),
             Value::Float(v) => Some(*v as i64),
             Value::Bool(_) | Value::Text(_) => None,
         }
@@ -72,7 +56,6 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(v) => write!(f, "{v}"),
-            Value::Uint(v) => write!(f, "{v}"),
             Value::Float(v) => write!(f, "{v}"),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Text(v) => write!(f, "{v}"),
@@ -80,10 +63,6 @@ impl fmt::Display for Value {
     }
 }
 
-/// Converts a state field into a [`Value`].
-///
-/// The `State` derive calls this for every field it compares. Implement it for field types outside
-/// the primitive set, usually by delegating to [`Value::text`].
 pub trait ToValue {
     fn to_value(&self) -> Value;
 }
@@ -100,9 +79,26 @@ macro_rules! impl_to_value {
     };
 }
 
-impl_to_value!(Int, i64, i8, i16, i32, i64, isize);
-impl_to_value!(Uint, u64, u8, u16, u32, u64, usize);
+impl_to_value!(Int, i64, i8, i16, i32, i64, isize, u8, u16, u32);
 impl_to_value!(Float, f64, f32, f64);
+
+// wider than i64, so Float
+macro_rules! impl_to_value_wide {
+    ($($ty:ty),+) => {
+        $(
+            impl ToValue for $ty {
+                fn to_value(&self) -> Value {
+                    match i64::try_from(*self) {
+                        Ok(value) => Value::Int(value),
+                        Err(_) => Value::Float(*self as f64),
+                    }
+                }
+            }
+        )+
+    };
+}
+
+impl_to_value_wide!(u64, usize);
 
 impl ToValue for bool {
     fn to_value(&self) -> Value {
@@ -140,7 +136,6 @@ pub struct StateChangeEvent {
     pub time: DateTime<Utc>,
     #[serde(rename = "AgentId")]
     pub agent_id: AgentId,
-    /// The field's name. Derived states supply a compile-time constant, so this normally borrows.
     #[serde(rename = "Field")]
     pub field: Cow<'static, str>,
     #[serde(rename = "NewValue")]
@@ -150,11 +145,7 @@ pub struct StateChangeEvent {
 }
 
 pub trait State: Sized + Clone + Default {
-    /// Appends one event per field that differs between `self` and `other`.
-    ///
-    /// Events are written into `out` rather than returned so a simulation can reuse one buffer
-    /// across every transition, and the id is supplied here so the caller does not have to walk the
-    /// results to stamp it on afterwards.
+    /// Appends one event per differing field.
     fn diff(
         &self,
         other: &Self,
@@ -383,16 +374,16 @@ mod tests {
     }
 
     #[test]
-    fn test_primitive_fields_convert_without_allocating_text() {
+    fn test_primitive_fields_convert() {
         assert_eq!(7i32.to_value(), Value::Int(7));
-        assert_eq!(7u8.to_value(), Value::Uint(7));
+        assert_eq!(7u8.to_value(), Value::Int(7));
         assert_eq!(1.5f32.to_value(), Value::Float(1.5));
         assert_eq!(true.to_value(), Value::Bool(true));
         assert_eq!(String::from("hi").to_value(), Value::Text(Arc::from("hi")));
     }
 
     #[test]
-    fn test_borrowed_field_names_clone_without_allocating() {
+    fn test_field_names_clone_borrowed() {
         let agent: AgentId = Arc::from("a");
         let original = event(&agent, "cpu", Value::Int(1), Value::Int(2), Utc::now());
         let copy = original.clone();
@@ -416,5 +407,30 @@ mod tests {
         let restored: StateChangeEvent = serde_json::from_str(&json).unwrap();
 
         assert_eq!(original, restored);
+    }
+
+    // untagged picks the first fit
+    #[test]
+    fn test_value_variants_round_trip() {
+        for value in [
+            Value::Int(5),
+            Value::Int(-5),
+            Value::Int(i64::MAX),
+            Value::Float(2.5),
+            Value::Float(2.0),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::text("hi"),
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            let restored: Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value, restored, "json {json}");
+        }
+    }
+
+    #[test]
+    fn test_unsigned_beyond_i64() {
+        assert_eq!(u64::MAX.to_value(), Value::Float(u64::MAX as f64));
+        assert!(u64::MAX.to_value().as_f64().unwrap() > 0.0);
     }
 }

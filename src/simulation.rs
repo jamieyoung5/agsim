@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use std::ops::ControlFlow;
 use std::time::{Duration as StdDuration, Instant};
 
-/// Controls which agents are fed an event emitted by another.
+/// Which agents see another's events.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Perception {
     #[default]
@@ -23,12 +23,9 @@ pub enum Perception {
 pub struct Simulation<A: SimAgent> {
     agents: Vec<A>,
     world: A::World,
-    /// Where simulated time is measured from. Offsets are whole milliseconds, so anchoring them to
-    /// the caller's start instant keeps its full precision instead of rounding it away.
     origin: DateTime<Utc>,
     current_ms: i64,
     event_log: Vec<StateChangeEvent>,
-    /// Reused across transitions so emitting events costs no allocation once warm.
     scratch: Vec<StateChangeEvent>,
     seed: u64,
     streams: Vec<SimRng>,
@@ -50,7 +47,6 @@ where
 }
 
 impl<A: SimAgent> Simulation<A> {
-    /// Builds a simulation over a prepared shared world.
     pub fn with_world(
         agents: Vec<A>,
         start_time: DateTime<Utc>,
@@ -99,11 +95,7 @@ impl<A: SimAgent> Simulation<A> {
         self.time_at(self.current_ms)
     }
 
-    /// Runs for `duration` of simulated time and returns the events emitted by this call.
-    ///
-    /// The log is handed over rather than copied, so a run costs one copy of its events rather
-    /// than two. Successive calls each report only their own events; use
-    /// [`run_streaming`](Self::run_streaming) to consume events without building a log at all.
+    /// Runs for `duration` and returns its events.
     pub fn run(&mut self, duration: Duration) -> Vec<StateChangeEvent> {
         let end_ms = self.current_ms.saturating_add(duration.num_milliseconds());
         let mut queue = self.initialize_queue();
@@ -120,7 +112,7 @@ impl<A: SimAgent> Simulation<A> {
         std::mem::take(&mut self.event_log)
     }
 
-    /// Like [`run`](Self::run), but hands each event to `callback` instead of accumulating a log.
+    /// Like [`run`](Self::run), but streams to `callback`.
     pub fn run_streaming<F>(&mut self, duration: Duration, mut callback: F)
     where
         F: FnMut(StateChangeEvent),
@@ -141,7 +133,7 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    /// Runs against the wall clock, open-ended, rather than over a fixed stretch of simulated time.
+    /// Runs open-ended against the wall clock.
     pub fn run_live<F>(&mut self, live: Live, callback: F) -> LiveOutcome
     where
         F: FnMut(StateChangeEvent) -> ControlFlow<()>,
@@ -198,7 +190,7 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    // holds until the wall clock reaches the point `target_ms` maps to under the run's speed
+    // wait for the wall clock
     fn wait_for<C: Clock + ?Sized>(
         clock: &C,
         live: &Live,
@@ -237,7 +229,6 @@ impl<A: SimAgent> Simulation<A> {
     }
 
     fn initialize_queue(&mut self) -> EventQueue<A::State> {
-        // proximity is the only mode that needs to find agents by where they are
         self.proximity = match self.perception {
             Perception::Proximity { radius } => {
                 SpatialIndex::build(radius, self.agents.iter().map(|agent| agent.location()))
@@ -266,8 +257,7 @@ impl<A: SimAgent> Simulation<A> {
         let target_type = event.next_state_type;
         let now = self.time_at(self.current_ms);
 
-        // taking the buffer hands its capacity to this transition and returns it afterwards, which
-        // keeps emitting events allocation-free without borrowing self twice
+        // avoid borrowing self twice
         let mut changes = std::mem::take(&mut self.scratch);
         changes.clear();
 
@@ -279,8 +269,7 @@ impl<A: SimAgent> Simulation<A> {
             &mut changes,
         );
 
-        // a transition is the only thing that can move an agent, so this is the only place the
-        // spatial index can fall out of date
+        // only place a location changes
         if let Some(index) = self.proximity.as_mut() {
             let moved_to = self.agents[agent_index].location();
             index.place(agent_index, moved_to);
@@ -297,12 +286,7 @@ impl<A: SimAgent> Simulation<A> {
         self.schedule_next_event(agent_index, queue);
     }
 
-    /// Feeds `changes` to whichever agents perceive them.
-    ///
-    /// Perception is resolved once per observer rather than once per observer per change, and
-    /// [`Perception::SelfOnly`] resolves to a single index without touching the other agents. An
-    /// observer only ever sees its own state through `observe`, so grouping the calls by observer
-    /// rather than by change is not observable.
+    // resolve perception once per observer
     fn dispatch_observations(&mut self, agent_index: usize, changes: &[StateChangeEvent]) {
         if changes.is_empty() {
             return;
@@ -323,11 +307,9 @@ impl<A: SimAgent> Simulation<A> {
                 }
             }
             Perception::Proximity { radius } => {
-                // an emitter with no position is perceived by nobody, so there is nothing to scan
                 let Some(emitter_pos) = self.agents[agent_index].location() else {
                     return;
                 };
-                // comparing squared distances keeps the same neighbourhood without the square root
                 let radius_squared = radius * radius;
 
                 match self.proximity.as_ref() {
@@ -344,7 +326,7 @@ impl<A: SimAgent> Simulation<A> {
                             }
                         }
                     }
-                    // a radius no grid can represent still has to produce the right answer
+                    // no grid, scan instead
                     None => {
                         for observer in &mut self.agents {
                             let near = observer.location().is_some_and(|pos| {
@@ -362,7 +344,7 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    // an event the timeline can't hold is one that never happens, so the agent goes unscheduled
+    // unrepresentable times go unscheduled
     fn schedule_time(&self, delay_sec: f64) -> Option<i64> {
         if !delay_sec.is_finite() || delay_sec < 0.0 {
             return None;
@@ -447,7 +429,6 @@ mod tests {
         Step2,
     }
 
-    // ObservingAgent fires a single transition and records every event fed back through observe.
     struct ObservingAgent {
         id: AgentId,
         fired: bool,
@@ -595,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_reports_only_its_own_events() {
+    fn test_run_reports_own_events() {
         let mut sim = Simulation::new_with_seed(vec![markov_agent("a")], base(), 21);
 
         let first = sim.run(Duration::seconds(30));
@@ -607,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proximity_includes_agents_exactly_on_the_radius() {
+    fn test_proximity_includes_radius_edge() {
         let agents = vec![
             ObservingAgent::at(Position::new(0.0, 0.0)),
             ObservingAgent::at(Position::new(3.0, 4.0)),
@@ -622,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proximity_ignores_an_emitter_without_a_position() {
+    fn test_proximity_emitter_without_position() {
         let agents = vec![
             ObservingAgent::new(),
             ObservingAgent::at(Position::new(0.0, 0.0)),
@@ -653,9 +634,8 @@ mod tests {
         assert_eq!(sim.agents()[2].observed.len(), 1);
     }
 
-    // a radius the grid cannot represent must still resolve perception by scanning
     #[test]
-    fn test_proximity_without_a_usable_radius_still_perceives() {
+    fn test_proximity_falls_back_without_index() {
         let agents = vec![
             ObservingAgent::at(Position::new(0.0, 0.0)),
             ObservingAgent::at(Position::new(0.0, 0.0)),
@@ -670,7 +650,6 @@ mod tests {
         assert_eq!(sim.agents()[1].observed.len(), 2);
     }
 
-    // MovingAgent walks along the x axis, so the spatial index has to follow it
     struct MovingAgent {
         id: AgentId,
         x: f64,
@@ -724,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proximity_follows_agents_that_move() {
+    fn test_proximity_follows_movement() {
         let agents = vec![
             MovingAgent {
                 id: Arc::from("walker"),
@@ -744,11 +723,9 @@ mod tests {
         sim.set_perception(Perception::Proximity { radius: 10.0 });
         sim.run(Duration::seconds(30));
 
-        // the walker only reaches the stationary agent's cell on its third step
         assert_eq!(sim.agents()[1].observed, 1);
     }
 
-    // Tape is a shared view of the last value every agent emitted.
     #[derive(Default)]
     struct Tape {
         last: i64,
@@ -764,7 +741,6 @@ mod tests {
         }
     }
 
-    // TapeReader writes a counter and reads the shared tape instead of being notified.
     struct TapeReader {
         id: AgentId,
         emitted: i64,
@@ -785,7 +761,6 @@ mod tests {
         }
 
         fn step(&self, _now: DateTime<Utc>, world: &Tape, _rng: &mut dyn RngCore) -> Option<()> {
-            // reading the shared view is the point: this is the pull side of perception
             let _ = world.last;
             (self.emitted < 3).then_some(())
         }
@@ -811,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_world_sees_every_change_and_agents_read_it() {
+    fn test_world_folds_and_agents_read() {
         let agents = vec![
             TapeReader {
                 id: Arc::from("a"),
@@ -831,7 +806,6 @@ mod tests {
         assert_eq!(sim.world().folded, events.len());
         assert_eq!(sim.world().last, 30);
 
-        // the first agent to act saw an empty tape; later transitions saw earlier ones
         let seen: Vec<i64> = sim
             .agents()
             .iter()
@@ -981,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unrepresentable_delays_leave_the_agent_unscheduled() {
+    fn test_unrepresentable_delays_unscheduled() {
         for delay in [f64::INFINITY, f64::NAN, -1.0, 1e30, 1e18] {
             let mut sim = Simulation::new_with_seed(vec![WildDelayAgent { delay }], base(), 1);
             assert!(sim.run(Duration::hours(1)).is_empty(), "delay {delay}");
@@ -1036,7 +1010,6 @@ mod tests {
         }
     }
 
-    // TickAgent transitions once a second, forever
     struct TickAgent {
         ticks: u32,
     }
@@ -1071,8 +1044,8 @@ mod tests {
                 time,
                 agent_id: Arc::from("tick"),
                 field: Cow::Borrowed("ticks"),
-                old_value: Value::Uint((self.ticks - 1) as u64),
-                new_value: Value::Uint(self.ticks as u64),
+                old_value: Value::Int((self.ticks - 1) as i64),
+                new_value: Value::Int(self.ticks as i64),
             });
         }
     }

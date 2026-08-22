@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-/// Pulls the first complete JSON object or array out of a model's reply.
+/// Pulls the first JSON value out.
 pub fn extract_json(text: &str) -> Option<Value> {
     let body = strip_reasoning(text);
     let body = strip_fences(body);
@@ -11,8 +11,7 @@ pub fn extract_json(text: &str) -> Option<Value> {
         .or_else(|| serde_json::from_str(&repair(candidate)).ok())
 }
 
-// reasoning-tuned small models emit chain of thought inline, and it is full of braces that would
-// otherwise look like the answer
+// reasoning text contains braces
 fn strip_reasoning(text: &str) -> &str {
     match text.rfind("</think>") {
         Some(end) => &text[end + "</think>".len()..],
@@ -20,14 +19,13 @@ fn strip_reasoning(text: &str) -> &str {
     }
 }
 
-// most instruct-tuned models wrap their reply in a fenced block whether or not they were asked to
+// models fence replies unasked
 fn strip_fences(text: &str) -> &str {
     let Some(open) = text.find("```") else {
         return text;
     };
     let after = &text[open + 3..];
     let body = match after.find('\n') {
-        // the opening fence may carry a language tag
         Some(newline) if after[..newline].trim().chars().all(char::is_alphanumeric) => {
             &after[newline + 1..]
         }
@@ -39,7 +37,7 @@ fn strip_fences(text: &str) -> &str {
     }
 }
 
-// ignores brackets inside string literals, so a brace in a description doesn't end the scan early
+// ignores brackets inside strings
 fn balanced_slice(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let start = bytes.iter().position(|b| *b == b'{' || *b == b'[')?;
@@ -67,7 +65,6 @@ fn balanced_slice(text: &str) -> Option<&str> {
             b if b == close => {
                 depth -= 1;
                 if depth == 0 {
-                    // every delimiter here is ASCII, so these are char boundaries.
                     return Some(&text[start..=index]);
                 }
             }
@@ -78,7 +75,7 @@ fn balanced_slice(text: &str) -> Option<&str> {
     None
 }
 
-// the one malformation small models produce often enough to be worth handling: a trailing comma
+// small models emit trailing commas
 fn repair(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_string = false;
@@ -99,7 +96,6 @@ fn repair(text: &str) -> String {
 
         match ch {
             ',' => {
-                // hold it back until we know what follows.
                 pending_comma = true;
                 continue;
             }
@@ -126,12 +122,12 @@ fn repair(text: &str) -> String {
     out
 }
 
-/// Looks a value up under any of the names a model might have used for it.
+/// Looks up a value by any name.
 pub fn field<'a>(object: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names.iter().find_map(|name| object.get(name))
 }
 
-/// Accepts a JSON number, or a number that came back quoted, which small models do freely.
+/// Accepts a number, quoted or not.
 pub fn number(value: &Value) -> Option<f64> {
     match value {
         Value::Number(n) => n.as_f64(),
@@ -152,8 +148,7 @@ pub fn text(value: &Value) -> Option<String> {
     }
 }
 
-/// Accepts JSON booleans, the affirmative and negative words a model may use in their place, and
-/// the integers one and zero.
+/// Accepts booleans, yes/no words, and 1/0.
 pub fn boolean(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),
@@ -167,7 +162,7 @@ pub fn boolean(value: &Value) -> Option<bool> {
     }
 }
 
-/// Accepts a list, or a single item where a list was asked for.
+/// Accepts a list or single item.
 pub fn array(value: &Value) -> Vec<&Value> {
     match value {
         Value::Array(items) => items.iter().collect(),
@@ -176,9 +171,7 @@ pub fn array(value: &Value) -> Vec<&Value> {
     }
 }
 
-/// Turns a JSON schema into a filled-in example of it. Models too small to follow a schema
-/// reliably will still copy the shape of an example, so backends that can't enforce a schema send
-/// this instead.
+/// Turns a schema into an example.
 pub fn sketch(schema: &Value) -> Value {
     match schema.get("type").and_then(Value::as_str) {
         Some("object") => {
@@ -201,7 +194,7 @@ pub fn sketch(schema: &Value) -> Value {
     }
 }
 
-/// The prompt suffix for a backend that can't constrain its own output.
+/// Prompt suffix for unconstrained backends.
 pub fn instructions(schema: &Value) -> String {
     format!(
         "Reply with JSON only. No prose, no explanation, no markdown fences. Match this shape \

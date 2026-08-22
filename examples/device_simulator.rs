@@ -98,7 +98,6 @@ fn main() {
 
     let mut agents = Vec::new();
 
-    // a fixed start time keeps the run reproducible end to end
     let start_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
     let mut rng = StdRng::seed_from_u64(42);
@@ -112,7 +111,7 @@ fn main() {
         ));
     }
 
-    // Simulation::new seeds itself from entropy, so this run will differ each time
+    // seeds from entropy
     let mut sim = Simulation::new(agents, start_time);
     let events = sim.run(Duration::days(7));
 
