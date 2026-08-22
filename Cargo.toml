@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "agsim"
-version = "2.0.1"
+version = "2.1.1"
 edition = "2024"
 description = "Discrete-event simulation framework for generating realistic synthetic time-series."
 license = "GPL-3.0-only"
@@ -32,8 +32,11 @@ local = [
 cuda = ["local", "candle-core/cuda", "candle-transformers/cuda"]
 metal = ["local", "candle-core/metal", "candle-transformers/metal"]
 
+[dev-dependencies]
+serde_json = "1"
+
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 chrono = { version = "0.4", features = ["serde"] }
 state_macros = { version = "0.2.0", path = "state_macros" }
 rand = "0.8.5"
@@ -54,3 +57,19 @@ features = ["llm"]
 [[example]]
 name = "small_model"
 required-features = ["llm"]
+
+[[bench]]
+name = "stress"
+harness = false
+
+[[bench]]
+name = "world"
+harness = false
+
+[[bench]]
+name = "alloc_profile"
+harness = false
+
+[[bench]]
+name = "memory_scaling"
+harness = false

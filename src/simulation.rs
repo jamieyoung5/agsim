@@ -1,15 +1,15 @@
 use crate::agent::SimAgent;
 use crate::clock::{Clock, Live, LiveOutcome, STOP_POLL_INTERVAL, SystemClock};
-use crate::rng;
+use crate::queue::{EventQueue, ScheduledEvent};
+use crate::rng::{self, SimRng};
+use crate::space::SpatialIndex;
 use crate::state::StateChangeEvent;
+use crate::world::World;
 use chrono::{DateTime, Duration, Utc};
-use rand::rngs::StdRng;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::ops::ControlFlow;
 use std::time::{Duration as StdDuration, Instant};
 
-/// Controls which agents are fed an event emitted by another.
+/// Which agents see another's events.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Perception {
     #[default]
@@ -20,58 +20,54 @@ pub enum Perception {
     },
 }
 
-struct ScheduledEvent<C> {
-    time: DateTime<Utc>,
-    agent_index: usize,
-    next_state_type: Option<C>,
-}
-
-impl<C> PartialEq for ScheduledEvent<C> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-impl<C> Eq for ScheduledEvent<C> {}
-impl<C> PartialOrd for ScheduledEvent<C> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<C> Ord for ScheduledEvent<C> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .time
-            .cmp(&self.time)
-            .then_with(|| other.agent_index.cmp(&self.agent_index))
-    }
-}
-
 pub struct Simulation<A: SimAgent> {
     agents: Vec<A>,
-    current_time: DateTime<Utc>,
+    world: A::World,
+    origin: DateTime<Utc>,
+    current_ms: i64,
     event_log: Vec<StateChangeEvent>,
+    scratch: Vec<StateChangeEvent>,
     seed: u64,
-    streams: Vec<StdRng>,
+    streams: Vec<SimRng>,
     perception: Perception,
+    proximity: Option<SpatialIndex>,
 }
 
-impl<A: SimAgent> Simulation<A> {
+impl<A: SimAgent> Simulation<A>
+where
+    A::World: Default,
+{
     pub fn new(agents: Vec<A>, start_time: DateTime<Utc>) -> Self {
         Self::new_with_seed(agents, start_time, rng::random_seed())
     }
 
     pub fn new_with_seed(agents: Vec<A>, start_time: DateTime<Utc>, seed: u64) -> Self {
+        Self::with_world(agents, start_time, seed, A::World::default())
+    }
+}
+
+impl<A: SimAgent> Simulation<A> {
+    pub fn with_world(
+        agents: Vec<A>,
+        start_time: DateTime<Utc>,
+        seed: u64,
+        world: A::World,
+    ) -> Self {
         let streams = (0..agents.len())
             .map(|index| rng::substream(seed, index as u64))
             .collect();
 
         Simulation {
             agents,
-            current_time: start_time,
+            world,
+            origin: start_time,
+            current_ms: 0,
             event_log: Vec::new(),
+            scratch: Vec::new(),
             seed,
             streams,
             perception: Perception::default(),
+            proximity: None,
         }
     }
 
@@ -87,48 +83,57 @@ impl<A: SimAgent> Simulation<A> {
         &self.agents
     }
 
-    pub fn current_time(&self) -> DateTime<Utc> {
-        self.current_time
+    pub fn world(&self) -> &A::World {
+        &self.world
     }
 
+    pub fn world_mut(&mut self) -> &mut A::World {
+        &mut self.world
+    }
+
+    pub fn current_time(&self) -> DateTime<Utc> {
+        self.time_at(self.current_ms)
+    }
+
+    /// Runs for `duration` and returns its events.
     pub fn run(&mut self, duration: Duration) -> Vec<StateChangeEvent> {
-        let end_time = self.current_time + duration;
+        let end_ms = self.current_ms.saturating_add(duration.num_milliseconds());
         let mut queue = self.initialize_queue();
 
         while let Some(event) = queue.pop() {
-            if event.time > end_time {
+            if event.time_ms > end_ms {
                 break;
             }
             self.process_event_step(event, &mut queue, |changes, log| {
-                log.extend(changes);
+                log.append(changes);
             });
         }
 
-        self.event_log.clone()
+        std::mem::take(&mut self.event_log)
     }
 
-    /// Like [`run`](Self::run), but hands each event to `callback` instead of accumulating a log.
+    /// Like [`run`](Self::run), but streams to `callback`.
     pub fn run_streaming<F>(&mut self, duration: Duration, mut callback: F)
     where
         F: FnMut(StateChangeEvent),
     {
-        let end_time = self.current_time + duration;
+        let end_ms = self.current_ms.saturating_add(duration.num_milliseconds());
         let mut queue = self.initialize_queue();
 
         while let Some(event) = queue.pop() {
-            if event.time > end_time {
+            if event.time_ms > end_ms {
                 break;
             }
 
             self.process_event_step(event, &mut queue, |changes, _| {
-                for change in changes {
+                for change in changes.drain(..) {
                     callback(change);
                 }
             });
         }
     }
 
-    /// Runs against the wall clock, open-ended, rather than over a fixed stretch of simulated time.
+    /// Runs open-ended against the wall clock.
     pub fn run_live<F>(&mut self, live: Live, callback: F) -> LiveOutcome
     where
         F: FnMut(StateChangeEvent) -> ControlFlow<()>,
@@ -146,9 +151,11 @@ impl<A: SimAgent> Simulation<A> {
         C: Clock + ?Sized,
         F: FnMut(StateChangeEvent) -> ControlFlow<()>,
     {
-        let sim_start = self.current_time;
+        let start_ms = self.current_ms;
         let wall_start = clock.now();
-        let deadline = live.horizon().map(|horizon| sim_start + horizon);
+        let deadline_ms = live
+            .horizon()
+            .map(|horizon| start_ms.saturating_add(horizon.num_milliseconds()));
         let mut queue = self.initialize_queue();
 
         loop {
@@ -160,17 +167,17 @@ impl<A: SimAgent> Simulation<A> {
                 return LiveOutcome::Drained;
             };
 
-            if deadline.is_some_and(|end| event.time > end) {
+            if deadline_ms.is_some_and(|end| event.time_ms > end) {
                 return LiveOutcome::HorizonReached;
             }
 
-            if !Self::wait_for(clock, &live, wall_start, sim_start, event.time) {
+            if !Self::wait_for(clock, &live, wall_start, start_ms, event.time_ms) {
                 return LiveOutcome::Stopped;
             }
 
             let mut flow = ControlFlow::Continue(());
             self.process_event_step(event, &mut queue, |changes, _| {
-                for change in changes {
+                for change in changes.drain(..) {
                     if flow.is_continue() {
                         flow = callback(change);
                     }
@@ -183,15 +190,15 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    // holds until the wall clock reaches the point `target` maps to under the run's speed
+    // wait for the wall clock
     fn wait_for<C: Clock + ?Sized>(
         clock: &C,
         live: &Live,
         wall_start: Instant,
-        sim_start: DateTime<Utc>,
-        target: DateTime<Utc>,
+        start_ms: i64,
+        target_ms: i64,
     ) -> bool {
-        let offset = (target - sim_start).num_milliseconds() as f64 / 1000.0 / live.speed();
+        let offset = (target_ms - start_ms) as f64 / 1000.0 / live.speed();
         if !offset.is_finite() || offset <= 0.0 {
             return !live.stop().is_stopped();
         }
@@ -211,8 +218,25 @@ impl<A: SimAgent> Simulation<A> {
         }
     }
 
-    fn initialize_queue(&mut self) -> BinaryHeap<ScheduledEvent<A::State>> {
-        let mut queue = BinaryHeap::new();
+    fn checked_time_at(&self, offset_ms: i64) -> Option<DateTime<Utc>> {
+        self.origin
+            .checked_add_signed(Duration::try_milliseconds(offset_ms)?)
+    }
+
+    fn time_at(&self, offset_ms: i64) -> DateTime<Utc> {
+        self.checked_time_at(offset_ms)
+            .expect("offsets are checked for representability when they are scheduled")
+    }
+
+    fn initialize_queue(&mut self) -> EventQueue<A::State> {
+        self.proximity = match self.perception {
+            Perception::Proximity { radius } => {
+                SpatialIndex::build(radius, self.agents.iter().map(|agent| agent.location()))
+            }
+            _ => None,
+        };
+
+        let mut queue = EventQueue::with_capacity(self.agents.len());
         for index in 0..self.agents.len() {
             self.schedule_next_event(index, &mut queue);
         }
@@ -222,53 +246,106 @@ impl<A: SimAgent> Simulation<A> {
     fn process_event_step<F>(
         &mut self,
         event: ScheduledEvent<A::State>,
-        queue: &mut BinaryHeap<ScheduledEvent<A::State>>,
+        queue: &mut EventQueue<A::State>,
         mut handler: F,
     ) where
-        F: FnMut(Vec<StateChangeEvent>, &mut Vec<StateChangeEvent>),
+        F: FnMut(&mut Vec<StateChangeEvent>, &mut Vec<StateChangeEvent>),
     {
-        self.current_time = event.time;
+        self.current_ms = event.time_ms;
 
-        if let Some(target_type) = event.next_state_type {
-            let agent_index = event.agent_index;
+        let agent_index = event.agent_index as usize;
+        let target_type = event.next_state_type;
+        let now = self.time_at(self.current_ms);
 
-            let changes = self.agents[agent_index].apply_transition(
-                target_type,
-                self.current_time,
-                &mut self.streams[agent_index],
-            );
+        // avoid borrowing self twice
+        let mut changes = std::mem::take(&mut self.scratch);
+        changes.clear();
 
-            for change in &changes {
-                for observer in 0..self.agents.len() {
-                    let perceives = match self.perception {
-                        Perception::SelfOnly => observer == agent_index,
-                        Perception::Global => true,
-                        Perception::Proximity { radius } => {
-                            match (
-                                self.agents[observer].location(),
-                                self.agents[agent_index].location(),
-                            ) {
-                                (Some(observer_pos), Some(emitter_pos)) => {
-                                    observer_pos.distance(&emitter_pos) <= radius
-                                }
-                                _ => false,
-                            }
-                        }
-                    };
-                    if perceives {
-                        self.agents[observer].observe(change);
+        self.agents[agent_index].apply_transition(
+            target_type,
+            now,
+            &self.world,
+            &mut self.streams[agent_index],
+            &mut changes,
+        );
+
+        // only place a location changes
+        if let Some(index) = self.proximity.as_mut() {
+            let moved_to = self.agents[agent_index].location();
+            index.place(agent_index, moved_to);
+        }
+
+        for change in &changes {
+            self.world.absorb(change);
+        }
+
+        self.dispatch_observations(agent_index, &changes);
+        handler(&mut changes, &mut self.event_log);
+
+        self.scratch = changes;
+        self.schedule_next_event(agent_index, queue);
+    }
+
+    // resolve perception once per observer
+    fn dispatch_observations(&mut self, agent_index: usize, changes: &[StateChangeEvent]) {
+        if changes.is_empty() {
+            return;
+        }
+
+        match self.perception {
+            Perception::SelfOnly => {
+                let emitter = &mut self.agents[agent_index];
+                for change in changes {
+                    emitter.observe(change);
+                }
+            }
+            Perception::Global => {
+                for observer in &mut self.agents {
+                    for change in changes {
+                        observer.observe(change);
                     }
                 }
             }
+            Perception::Proximity { radius } => {
+                let Some(emitter_pos) = self.agents[agent_index].location() else {
+                    return;
+                };
+                let radius_squared = radius * radius;
 
-            handler(changes, &mut self.event_log);
-
-            self.schedule_next_event(agent_index, queue);
+                match self.proximity.as_ref() {
+                    Some(index) => {
+                        for observer in index.candidates(emitter_pos) {
+                            let agent = &mut self.agents[observer];
+                            let near = agent.location().is_some_and(|pos| {
+                                pos.distance_squared(&emitter_pos) <= radius_squared
+                            });
+                            if near {
+                                for change in changes {
+                                    agent.observe(change);
+                                }
+                            }
+                        }
+                    }
+                    // no grid, scan instead
+                    None => {
+                        for observer in &mut self.agents {
+                            let near = observer.location().is_some_and(|pos| {
+                                pos.distance_squared(&emitter_pos) <= radius_squared
+                            });
+                            if near {
+                                for change in changes {
+                                    observer.observe(change);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // an event the timeline can't hold is one that never happens, so the agent goes unscheduled
-    fn schedule_time(from: DateTime<Utc>, delay_sec: f64) -> Option<DateTime<Utc>> {
+    // unrepresentable times go unscheduled
+    fn schedule_time(&self, delay_sec: f64) -> Option<i64> {
         if !delay_sec.is_finite() || delay_sec < 0.0 {
             return None;
         }
@@ -278,32 +355,33 @@ impl<A: SimAgent> Simulation<A> {
             return None;
         }
 
-        from.checked_add_signed(Duration::try_milliseconds(millis as i64)?)
+        let at = self.current_ms.checked_add(millis as i64)?;
+        self.checked_time_at(at).is_some().then_some(at)
     }
 
-    fn schedule_next_event(
-        &mut self,
-        agent_index: usize,
-        queue: &mut BinaryHeap<ScheduledEvent<A::State>>,
-    ) {
-        let Some(delay_sec) = self.agents[agent_index]
-            .peek_next_event_delay(self.current_time, &mut self.streams[agent_index])
-        else {
+    fn schedule_next_event(&mut self, agent_index: usize, queue: &mut EventQueue<A::State>) {
+        let now = self.time_at(self.current_ms);
+
+        let Some(delay_sec) = self.agents[agent_index].peek_next_event_delay(
+            now,
+            &self.world,
+            &mut self.streams[agent_index],
+        ) else {
             return;
         };
         let Some(next_state) =
-            self.agents[agent_index].step(self.current_time, &mut self.streams[agent_index])
+            self.agents[agent_index].step(now, &self.world, &mut self.streams[agent_index])
         else {
             return;
         };
 
-        let Some(event_time) = Self::schedule_time(self.current_time, delay_sec) else {
+        let Some(time_ms) = self.schedule_time(delay_sec) else {
             return;
         };
         queue.push(ScheduledEvent {
-            time: event_time,
-            agent_index,
-            next_state_type: Some(next_state),
+            time_ms,
+            agent_index: agent_index as u32,
+            next_state_type: next_state,
         });
     }
 }
@@ -312,9 +390,13 @@ impl<A: SimAgent> Simulation<A> {
 mod tests {
     use super::*;
     use crate::agent::{Agent, StateType};
-    use crate::state::{State, StateChangeEvent};
-    use rand::{RngCore, SeedableRng};
+    use crate::space::Position;
+    use crate::state::{AgentId, State, StateChangeEvent, ToValue, Value};
+    use crate::world::World;
+    use rand::RngCore;
+    use std::borrow::Cow;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[derive(Clone, Default, Debug, PartialEq)]
     struct MockState {
@@ -322,17 +404,21 @@ mod tests {
     }
 
     impl State for MockState {
-        fn diff(&self, other: &Self, time: DateTime<Utc>) -> Vec<StateChangeEvent> {
+        fn diff(
+            &self,
+            other: &Self,
+            agent_id: &AgentId,
+            time: DateTime<Utc>,
+            out: &mut Vec<StateChangeEvent>,
+        ) {
             if self.counter != other.counter {
-                vec![StateChangeEvent {
+                out.push(StateChangeEvent {
                     time,
-                    agent_id: String::new(),
-                    field: "counter".to_string(),
-                    old_value: self.counter.to_string(),
-                    new_value: other.counter.to_string(),
-                }]
-            } else {
-                vec![]
+                    agent_id: agent_id.clone(),
+                    field: Cow::Borrowed("counter"),
+                    old_value: self.counter.to_value(),
+                    new_value: other.counter.to_value(),
+                });
             }
         }
     }
@@ -343,12 +429,11 @@ mod tests {
         Step2,
     }
 
-    // ObservingAgent fires a single transition and records every event fed back through observe.
     struct ObservingAgent {
-        id: String,
+        id: AgentId,
         fired: bool,
         observed: Vec<String>,
-        location: Option<crate::space::Position>,
+        location: Option<Position>,
     }
 
     impl ObservingAgent {
@@ -358,14 +443,14 @@ mod tests {
 
         fn named(id: &str) -> Self {
             ObservingAgent {
-                id: id.to_string(),
+                id: Arc::from(id),
                 fired: false,
                 observed: Vec::new(),
                 location: None,
             }
         }
 
-        fn at(position: crate::space::Position) -> Self {
+        fn at(position: Position) -> Self {
             ObservingAgent {
                 location: Some(position),
                 ..Self::new()
@@ -375,16 +460,18 @@ mod tests {
 
     impl SimAgent for ObservingAgent {
         type State = ();
+        type World = ();
 
         fn peek_next_event_delay(
             &self,
             _now: DateTime<Utc>,
+            _world: &(),
             _rng: &mut dyn RngCore,
         ) -> Option<f64> {
             if self.fired { None } else { Some(1.0) }
         }
 
-        fn step(&self, _now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<()> {
+        fn step(&self, _now: DateTime<Utc>, _world: &(), _rng: &mut dyn RngCore) -> Option<()> {
             if self.fired { None } else { Some(()) }
         }
 
@@ -392,85 +479,56 @@ mod tests {
             &mut self,
             _next: (),
             time: DateTime<Utc>,
+            _world: &(),
             _rng: &mut dyn RngCore,
-        ) -> Vec<StateChangeEvent> {
+            out: &mut Vec<StateChangeEvent>,
+        ) {
             self.fired = true;
-            vec![StateChangeEvent {
+            out.push(StateChangeEvent {
                 time,
                 agent_id: self.id.clone(),
-                field: "state".to_string(),
-                old_value: "0".to_string(),
-                new_value: "1".to_string(),
-            }]
+                field: Cow::Borrowed("state"),
+                old_value: Value::Int(0),
+                new_value: Value::Int(1),
+            });
         }
 
         fn observe(&mut self, event: &StateChangeEvent) {
-            self.observed.push(event.field.clone());
+            self.observed.push(event.field.to_string());
         }
 
-        fn location(&self) -> Option<crate::space::Position> {
+        fn location(&self) -> Option<Position> {
             self.location
         }
     }
 
-    #[test]
-    fn test_simulation_queue_ordering() {
-        let time = Utc::now();
-
-        let event_early = ScheduledEvent {
-            time: time,
-            agent_index: 0,
-            next_state_type: Some(1),
-        };
-
-        let event_late = ScheduledEvent {
-            time: time + Duration::seconds(10),
-            agent_index: 1,
-            next_state_type: Some(1),
-        };
-
-        assert!(event_early > event_late);
-
-        let mut heap = BinaryHeap::new();
-        heap.push(event_late);
-        heap.push(event_early);
-
-        let popped = heap.pop().unwrap();
-        assert_eq!(popped.agent_index, 0);
+    fn two_step_matrix(rate: f64) -> HashMap<SimState, StateType<SimState, MockState>> {
+        HashMap::from([
+            (
+                SimState::Step1,
+                StateType::new_deterministic(
+                    || MockState { counter: 1 },
+                    vec![(SimState::Step2, 1.0)],
+                    rate,
+                ),
+            ),
+            (
+                SimState::Step2,
+                StateType::new_deterministic(
+                    || MockState { counter: 2 },
+                    vec![(SimState::Step1, 1.0)],
+                    rate,
+                ),
+            ),
+        ])
     }
 
     #[test]
     fn test_simulation_run_flow() {
-        let start_time = Utc::now();
-        let mut rng = StdRng::seed_from_u64(123);
-        let mut transitions = HashMap::new();
+        let mut rng = SimRng::seed_from_u64(123);
+        let agent = Agent::new("sim_agent", SimState::Step1, two_step_matrix(0.1), &mut rng);
 
-        transitions.insert(
-            SimState::Step1,
-            StateType::new_deterministic(
-                || MockState { counter: 1 },
-                vec![(SimState::Step2, 1.0)],
-                0.1,
-            ),
-        );
-        transitions.insert(
-            SimState::Step2,
-            StateType::new_deterministic(
-                || MockState { counter: 2 },
-                vec![(SimState::Step1, 1.0)],
-                0.1,
-            ),
-        );
-
-        let agent = Agent::new(
-            "sim_agent".to_string(),
-            SimState::Step1,
-            transitions,
-            &mut rng,
-        );
-
-        let mut sim = Simulation::new(vec![agent], start_time);
-
+        let mut sim = Simulation::new(vec![agent], base());
         let events = sim.run(Duration::seconds(1));
 
         assert!(
@@ -478,41 +536,28 @@ mod tests {
             "Events list should not be empty with a 0.1s mean delay over 1s duration"
         );
 
-        let first_event = &events[0];
-        assert_eq!(first_event.agent_id, "sim_agent");
-        assert_eq!(first_event.field, "counter");
-
-        assert!(sim.current_time > start_time);
+        assert_eq!(&*events[0].agent_id, "sim_agent");
+        assert_eq!(events[0].field, "counter");
+        assert!(sim.current_time() > base());
     }
 
     #[test]
     fn test_simulation_termination() {
-        let start_time = Utc::now();
-        let mut rng = StdRng::seed_from_u64(123);
-        let mut transitions = HashMap::new();
-
-        transitions.insert(
+        let mut rng = SimRng::seed_from_u64(123);
+        let transitions = HashMap::from([(
             SimState::Step1,
             StateType::new_deterministic(|| MockState { counter: 1 }, vec![], 1.0),
-        );
+        )]);
 
-        let agent = Agent::new(
-            "term_agent".to_string(),
-            SimState::Step1,
-            transitions,
-            &mut rng,
-        );
+        let agent = Agent::new("term_agent", SimState::Step1, transitions, &mut rng);
+        let mut sim = Simulation::new(vec![agent], base());
 
-        let mut sim = Simulation::new(vec![agent], start_time);
-
-        let events = sim.run(Duration::hours(1));
-        assert!(events.is_empty());
+        assert!(sim.run(Duration::hours(1)).is_empty());
     }
 
     #[test]
     fn test_observation_feed() {
-        let start_time = Utc::now();
-        let mut sim = Simulation::new(vec![ObservingAgent::new()], start_time);
+        let mut sim = Simulation::new(vec![ObservingAgent::new()], base());
         sim.run(Duration::seconds(10));
 
         assert_eq!(sim.agents()[0].observed, vec!["state".to_string()]);
@@ -520,10 +565,9 @@ mod tests {
 
     #[test]
     fn test_global_perception() {
-        let start_time = Utc::now();
         let agents = vec![ObservingAgent::new(), ObservingAgent::new()];
 
-        let mut sim = Simulation::new(agents, start_time);
+        let mut sim = Simulation::new(agents, base());
         sim.set_perception(Perception::Global);
         sim.run(Duration::seconds(10));
 
@@ -532,17 +576,56 @@ mod tests {
     }
 
     #[test]
-    fn test_proximity_perception() {
-        use crate::space::Position;
+    fn test_run_reports_own_events() {
+        let mut sim = Simulation::new_with_seed(vec![markov_agent("a")], base(), 21);
 
-        let start_time = Utc::now();
+        let first = sim.run(Duration::seconds(30));
+        let second = sim.run(Duration::seconds(30));
+
+        assert!(!first.is_empty());
+        assert!(!second.is_empty());
+        assert!(second.iter().all(|event| !first.contains(event)));
+    }
+
+    #[test]
+    fn test_proximity_includes_radius_edge() {
+        let agents = vec![
+            ObservingAgent::at(Position::new(0.0, 0.0)),
+            ObservingAgent::at(Position::new(3.0, 4.0)),
+        ];
+
+        let mut sim = Simulation::new_with_seed(agents, base(), 3);
+        sim.set_perception(Perception::Proximity { radius: 5.0 });
+        sim.run(Duration::seconds(10));
+
+        assert_eq!(sim.agents()[0].observed.len(), 2);
+        assert_eq!(sim.agents()[1].observed.len(), 2);
+    }
+
+    #[test]
+    fn test_proximity_emitter_without_position() {
+        let agents = vec![
+            ObservingAgent::new(),
+            ObservingAgent::at(Position::new(0.0, 0.0)),
+        ];
+
+        let mut sim = Simulation::new_with_seed(agents, base(), 3);
+        sim.set_perception(Perception::Proximity { radius: 100.0 });
+        sim.run(Duration::seconds(10));
+
+        assert!(sim.agents()[0].observed.is_empty());
+        assert_eq!(sim.agents()[1].observed.len(), 1);
+    }
+
+    #[test]
+    fn test_proximity_perception() {
         let agents = vec![
             ObservingAgent::at(Position::new(0.0, 0.0)),
             ObservingAgent::at(Position::new(1.0, 0.0)),
             ObservingAgent::at(Position::new(100.0, 0.0)),
         ];
 
-        let mut sim = Simulation::new(agents, start_time);
+        let mut sim = Simulation::new(agents, base());
         sim.set_perception(Perception::Proximity { radius: 5.0 });
         sim.run(Duration::seconds(10));
 
@@ -551,31 +634,212 @@ mod tests {
         assert_eq!(sim.agents()[2].observed.len(), 1);
     }
 
-    fn markov_agent(id: &str) -> Agent<SimState, MockState> {
-        let mut rng = StdRng::seed_from_u64(9);
-        let mut transitions = HashMap::new();
+    #[test]
+    fn test_proximity_falls_back_without_index() {
+        let agents = vec![
+            ObservingAgent::at(Position::new(0.0, 0.0)),
+            ObservingAgent::at(Position::new(0.0, 0.0)),
+        ];
 
-        transitions.insert(
-            SimState::Step1,
-            StateType::new_deterministic(
-                || MockState { counter: 1 },
-                vec![(SimState::Step2, 0.7), (SimState::Step1, 0.3)],
-                0.1,
-            ),
-        );
-        transitions.insert(
-            SimState::Step2,
-            StateType::new_deterministic(
-                || MockState { counter: 2 },
-                vec![(SimState::Step1, 0.7), (SimState::Step2, 0.3)],
-                0.1,
-            ),
-        );
+        let mut sim = Simulation::new_with_seed(agents, base(), 3);
+        sim.set_perception(Perception::Proximity { radius: 0.0 });
+        sim.run(Duration::seconds(10));
 
-        Agent::new(id.to_string(), SimState::Step1, transitions, &mut rng)
+        assert!(sim.proximity.is_none());
+        assert_eq!(sim.agents()[0].observed.len(), 2);
+        assert_eq!(sim.agents()[1].observed.len(), 2);
     }
 
-    fn fingerprint(events: &[StateChangeEvent]) -> Vec<(DateTime<Utc>, String, String)> {
+    struct MovingAgent {
+        id: AgentId,
+        x: f64,
+        steps: u32,
+        observed: usize,
+    }
+
+    impl SimAgent for MovingAgent {
+        type State = ();
+        type World = ();
+
+        fn peek_next_event_delay(
+            &self,
+            _now: DateTime<Utc>,
+            _world: &(),
+            _rng: &mut dyn RngCore,
+        ) -> Option<f64> {
+            (self.steps < 4).then_some(1.0)
+        }
+
+        fn step(&self, _now: DateTime<Utc>, _world: &(), _rng: &mut dyn RngCore) -> Option<()> {
+            (self.steps < 4).then_some(())
+        }
+
+        fn apply_transition(
+            &mut self,
+            _next: (),
+            time: DateTime<Utc>,
+            _world: &(),
+            _rng: &mut dyn RngCore,
+            out: &mut Vec<StateChangeEvent>,
+        ) {
+            self.steps += 1;
+            self.x += 100.0;
+            out.push(StateChangeEvent {
+                time,
+                agent_id: self.id.clone(),
+                field: Cow::Borrowed("x"),
+                old_value: Value::Float(self.x - 100.0),
+                new_value: Value::Float(self.x),
+            });
+        }
+
+        fn observe(&mut self, _event: &StateChangeEvent) {
+            self.observed += 1;
+        }
+
+        fn location(&self) -> Option<Position> {
+            Some(Position::new(self.x, 0.0))
+        }
+    }
+
+    #[test]
+    fn test_proximity_follows_movement() {
+        let agents = vec![
+            MovingAgent {
+                id: Arc::from("walker"),
+                x: 0.0,
+                steps: 0,
+                observed: 0,
+            },
+            MovingAgent {
+                id: Arc::from("post_300"),
+                x: 300.0,
+                steps: 4,
+                observed: 0,
+            },
+        ];
+
+        let mut sim = Simulation::new_with_seed(agents, base(), 5);
+        sim.set_perception(Perception::Proximity { radius: 10.0 });
+        sim.run(Duration::seconds(30));
+
+        assert_eq!(sim.agents()[1].observed, 1);
+    }
+
+    #[derive(Default)]
+    struct Tape {
+        last: i64,
+        folded: usize,
+    }
+
+    impl World for Tape {
+        fn absorb(&mut self, event: &StateChangeEvent) {
+            self.folded += 1;
+            if let Value::Int(value) = event.new_value {
+                self.last = value;
+            }
+        }
+    }
+
+    struct TapeReader {
+        id: AgentId,
+        emitted: i64,
+        seen_on_step: Vec<i64>,
+    }
+
+    impl SimAgent for TapeReader {
+        type State = ();
+        type World = Tape;
+
+        fn peek_next_event_delay(
+            &self,
+            _now: DateTime<Utc>,
+            _world: &Tape,
+            _rng: &mut dyn RngCore,
+        ) -> Option<f64> {
+            (self.emitted < 3).then_some(1.0)
+        }
+
+        fn step(&self, _now: DateTime<Utc>, world: &Tape, _rng: &mut dyn RngCore) -> Option<()> {
+            let _ = world.last;
+            (self.emitted < 3).then_some(())
+        }
+
+        fn apply_transition(
+            &mut self,
+            _next: (),
+            time: DateTime<Utc>,
+            world: &Tape,
+            _rng: &mut dyn RngCore,
+            out: &mut Vec<StateChangeEvent>,
+        ) {
+            self.seen_on_step.push(world.last);
+            self.emitted += 1;
+            out.push(StateChangeEvent {
+                time,
+                agent_id: self.id.clone(),
+                field: Cow::Borrowed("tick"),
+                old_value: Value::Int(self.emitted - 1),
+                new_value: Value::Int(self.emitted * 10),
+            });
+        }
+    }
+
+    #[test]
+    fn test_world_folds_and_agents_read() {
+        let agents = vec![
+            TapeReader {
+                id: Arc::from("a"),
+                emitted: 0,
+                seen_on_step: Vec::new(),
+            },
+            TapeReader {
+                id: Arc::from("b"),
+                emitted: 0,
+                seen_on_step: Vec::new(),
+            },
+        ];
+
+        let mut sim = Simulation::with_world(agents, base(), 7, Tape::default());
+        let events = sim.run(Duration::seconds(10));
+
+        assert_eq!(sim.world().folded, events.len());
+        assert_eq!(sim.world().last, 30);
+
+        let seen: Vec<i64> = sim
+            .agents()
+            .iter()
+            .flat_map(|a| a.seen_on_step.clone())
+            .collect();
+        assert!(seen.contains(&0));
+        assert!(seen.iter().any(|&v| v > 0));
+    }
+
+    fn markov_agent(id: &str) -> Agent<SimState, MockState> {
+        let mut rng = SimRng::seed_from_u64(9);
+        let transitions = HashMap::from([
+            (
+                SimState::Step1,
+                StateType::new_deterministic(
+                    || MockState { counter: 1 },
+                    vec![(SimState::Step2, 0.7), (SimState::Step1, 0.3)],
+                    0.1,
+                ),
+            ),
+            (
+                SimState::Step2,
+                StateType::new_deterministic(
+                    || MockState { counter: 2 },
+                    vec![(SimState::Step1, 0.7), (SimState::Step2, 0.3)],
+                    0.1,
+                ),
+            ),
+        ]);
+
+        Agent::new(id, SimState::Step1, transitions, &mut rng)
+    }
+
+    fn fingerprint(events: &[StateChangeEvent]) -> Vec<(DateTime<Utc>, AgentId, Value)> {
         events
             .iter()
             .map(|e| (e.time, e.agent_id.clone(), e.new_value.clone()))
@@ -638,7 +902,7 @@ mod tests {
         let solo = alone.run(Duration::seconds(60));
         let shared = crowded.run(Duration::seconds(60));
 
-        let a_events: Vec<_> = shared.into_iter().filter(|e| e.agent_id == "a").collect();
+        let a_events: Vec<_> = shared.into_iter().filter(|e| &*e.agent_id == "a").collect();
         assert!(!solo.is_empty());
         assert_eq!(fingerprint(&solo), fingerprint(&a_events));
     }
@@ -654,7 +918,7 @@ mod tests {
         let mut sim = Simulation::new_with_seed(agents, base(), 5);
         let events = sim.run(Duration::seconds(10));
 
-        let ids: Vec<_> = events.iter().map(|e| e.agent_id.as_str()).collect();
+        let ids: Vec<_> = events.iter().map(|e| e.agent_id.to_string()).collect();
         assert_eq!(ids, vec!["first", "second", "third"]);
     }
 
@@ -664,16 +928,18 @@ mod tests {
 
     impl SimAgent for WildDelayAgent {
         type State = ();
+        type World = ();
 
         fn peek_next_event_delay(
             &self,
             _now: DateTime<Utc>,
+            _world: &(),
             _rng: &mut dyn RngCore,
         ) -> Option<f64> {
             Some(self.delay)
         }
 
-        fn step(&self, _now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<()> {
+        fn step(&self, _now: DateTime<Utc>, _world: &(), _rng: &mut dyn RngCore) -> Option<()> {
             Some(())
         }
 
@@ -681,15 +947,16 @@ mod tests {
             &mut self,
             _next: (),
             _time: DateTime<Utc>,
+            _world: &(),
             _rng: &mut dyn RngCore,
-        ) -> Vec<StateChangeEvent> {
-            Vec::new()
+            _out: &mut Vec<StateChangeEvent>,
+        ) {
         }
     }
 
     #[test]
-    fn test_unrepresentable_delays_leave_the_agent_unscheduled() {
-        for delay in [f64::INFINITY, f64::NAN, -1.0, 1e30] {
+    fn test_unrepresentable_delays_unscheduled() {
+        for delay in [f64::INFINITY, f64::NAN, -1.0, 1e30, 1e18] {
             let mut sim = Simulation::new_with_seed(vec![WildDelayAgent { delay }], base(), 1);
             assert!(sim.run(Duration::hours(1)).is_empty(), "delay {delay}");
             assert_eq!(sim.current_time(), base());
@@ -698,19 +965,17 @@ mod tests {
 
     #[test]
     fn test_infinite_event_rate_does_not_panic() {
-        let mut rng = StdRng::seed_from_u64(1);
-        let mut transitions = HashMap::new();
-
-        transitions.insert(
+        let mut rng = SimRng::seed_from_u64(1);
+        let transitions = HashMap::from([(
             SimState::Step1,
             StateType::new_deterministic(
                 || MockState { counter: 1 },
                 vec![(SimState::Step2, 1.0)],
                 f64::INFINITY,
             ),
-        );
+        )]);
 
-        let agent = Agent::new("wild".to_string(), SimState::Step1, transitions, &mut rng);
+        let agent = Agent::new("wild", SimState::Step1, transitions, &mut rng);
         let mut sim = Simulation::new_with_seed(vec![agent], base(), 1);
 
         assert!(sim.run(Duration::hours(1)).is_empty());
@@ -745,23 +1010,24 @@ mod tests {
         }
     }
 
-    // TickAgent transitions once a second, forever
     struct TickAgent {
         ticks: u32,
     }
 
     impl SimAgent for TickAgent {
         type State = ();
+        type World = ();
 
         fn peek_next_event_delay(
             &self,
             _now: DateTime<Utc>,
+            _world: &(),
             _rng: &mut dyn RngCore,
         ) -> Option<f64> {
             Some(1.0)
         }
 
-        fn step(&self, _now: DateTime<Utc>, _rng: &mut dyn RngCore) -> Option<()> {
+        fn step(&self, _now: DateTime<Utc>, _world: &(), _rng: &mut dyn RngCore) -> Option<()> {
             Some(())
         }
 
@@ -769,16 +1035,18 @@ mod tests {
             &mut self,
             _next: (),
             time: DateTime<Utc>,
+            _world: &(),
             _rng: &mut dyn RngCore,
-        ) -> Vec<StateChangeEvent> {
+            out: &mut Vec<StateChangeEvent>,
+        ) {
             self.ticks += 1;
-            vec![StateChangeEvent {
+            out.push(StateChangeEvent {
                 time,
-                agent_id: "tick".to_string(),
-                field: "ticks".to_string(),
-                old_value: (self.ticks - 1).to_string(),
-                new_value: self.ticks.to_string(),
-            }]
+                agent_id: Arc::from("tick"),
+                field: Cow::Borrowed("ticks"),
+                old_value: Value::Int((self.ticks - 1) as i64),
+                new_value: Value::Int(self.ticks as i64),
+            });
         }
     }
 

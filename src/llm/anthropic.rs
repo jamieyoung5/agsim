@@ -7,7 +7,7 @@ const DEFAULT_MODEL: &str = "claude-opus-5";
 pub struct Anthropic {
     api_key: String,
     pub model: String,
-    /// Effort spent on the reasoning-heavy calls: `low`, `medium`, `high`, `xhigh`, or `max`.
+    /// Effort: `low`, `medium`, `high`, `xhigh`, `max`.
     pub effort: String,
     pub max_tokens: u32,
 }

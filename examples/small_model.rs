@@ -48,7 +48,7 @@ fn device_state(mode: &Mode, rng: &mut dyn RngCore) -> DeviceState {
     }
 }
 
-// a small model likely won't stick to a vocabulary so we match loosely on whatever it wrote
+// match loosely, models drift
 fn interpret_mode(step: &agsim::planning::PlanStep) -> Mode {
     let activity = step.description.to_lowercase();
     if activity.contains("offline") || activity.contains("asleep") || activity.contains("shut") {

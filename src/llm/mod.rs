@@ -603,10 +603,10 @@ mod tests {
     fn test_importance_falls_back_when_the_model_fails() {
         let event = StateChangeEvent {
             time: base(),
-            agent_id: "device".to_string(),
-            field: "cpu".to_string(),
-            old_value: "1".to_string(),
-            new_value: "90".to_string(),
+            agent_id: std::sync::Arc::from("device"),
+            field: std::borrow::Cow::Borrowed("cpu"),
+            old_value: crate::state::Value::Int(1),
+            new_value: crate::state::Value::Int(90),
         };
 
         let mind = scripted(vec![Some(r#"{"importance": "8.5"}"#)]);

@@ -24,7 +24,7 @@ struct DeviceState {
     cpu_in_use_percent: f32,
 }
 
-// the mode -> state factory: plausible metrics for whatever the plan has the device doing
+// mode -> state
 fn device_state(mode: &DeviceOperationalMode, rng: &mut dyn RngCore) -> DeviceState {
     match mode {
         DeviceOperationalMode::Offline => DeviceState {
@@ -54,7 +54,7 @@ fn device_state(mode: &DeviceOperationalMode, rng: &mut dyn RngCore) -> DeviceSt
     }
 }
 
-// the plan step -> mode reading. a model writes prose, so match loosely on what it wrote
+// plan step -> mode
 fn interpret_mode(step: &PlanStep) -> DeviceOperationalMode {
     let activity = step.description.to_lowercase();
     if activity.contains("offline") {
@@ -68,8 +68,7 @@ fn interpret_mode(step: &PlanStep) -> DeviceOperationalMode {
     }
 }
 
-// a deterministic stand-in for an LLM: fixed daily routine, no reactions, trivial reflection.
-// keeps the example runnable with no API key.
+// scripted stand-in for an LLM
 struct ScriptedMind;
 
 impl Planner for ScriptedMind {
@@ -93,7 +92,6 @@ impl Planner for ScriptedMind {
         ]
     }
 
-    // the routine blocks are the granularity we want, so no further decomposition.
     fn decompose(&self, _step: &PlanStep, _ctx: &PlanContext) -> Vec<PlanStep> {
         Vec::new()
     }
@@ -128,8 +126,8 @@ impl Reflector for ScriptedMind {
 
 impl Mind for ScriptedMind {
     fn importance(&self, event: &StateChangeEvent) -> f64 {
-        // CPU spikes and connectivity changes are more poignant than routine memory churn.
-        match event.field.as_str() {
+        // spikes matter more than churn
+        match event.field.as_ref() {
             "cpu_in_use_percent" => 6.0,
             "connected_status" => 5.0,
             _ => 2.0,
@@ -138,7 +136,6 @@ impl Mind for ScriptedMind {
 }
 
 fn main() {
-    // fixed start time + seeded agent construction + a seeded simulation: the whole run replays.
     let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let mut rng = StdRng::seed_from_u64(7);
 
@@ -154,7 +151,7 @@ fn main() {
             start,
             &mut rng,
         );
-        // lower the reflection trigger so reflection is visible within a short demo run.
+        // low enough to fire here
         agent.memory.reflection_threshold = 50.0;
         agents.push(agent);
     }
