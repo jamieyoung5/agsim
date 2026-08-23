@@ -251,7 +251,7 @@ impl MemoryStream {
 
     fn recent(&self, n: usize) -> Vec<&Memory> {
         let mut refs: Vec<&Memory> = self.memories.iter().collect();
-        refs.sort_by(|a, b| b.created.cmp(&a.created));
+        refs.sort_by_key(|m| std::cmp::Reverse(m.created));
         refs.truncate(n);
         refs
     }
