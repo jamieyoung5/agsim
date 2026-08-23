@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Verify and package without publishing
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve versions
+        id: versions
+        run: |
+          set -euo pipefail
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          agsim=$(jq -r '.packages[] | select(.name == "agsim") | .version' <<<"$metadata")
+          macros=$(jq -r '.packages[] | select(.name == "state_macros") | .version' <<<"$metadata")
+
+          if [ "${{ github.event_name }}" = "push" ] && [ "${GITHUB_REF_NAME#v}" != "$agsim" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match agsim ${agsim} in Cargo.toml"
+            exit 1
+          fi
+
+          echo "agsim=$agsim" >> "$GITHUB_OUTPUT"
+          echo "state_macros=$macros" >> "$GITHUB_OUTPUT"
+
+      - name: Check what is already published
+        id: published
+        run: |
+          set -euo pipefail
+          on_index() {
+            curl -sf "https://index.crates.io/$2" \
+              | jq -e --arg v "$1" 'select(.vers == $v)' >/dev/null 2>&1
+          }
+
+          if on_index "${{ steps.versions.outputs.state_macros }}" "st/at/state_macros"; then
+            echo "state_macros=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "state_macros=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if on_index "${{ steps.versions.outputs.agsim }}" "ag/si/agsim"; then
+            echo "agsim=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "agsim=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test
+        run: cargo test --workspace --features llm --locked
+
+      - name: Publish state_macros
+        if: steps.published.outputs.state_macros == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            cargo publish -p state_macros --locked --dry-run
+          else
+            cargo publish -p state_macros --locked
+          fi
+
+      - name: Wait for state_macros on the index
+        if: steps.published.outputs.state_macros == 'false' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          version="${{ steps.versions.outputs.state_macros }}"
+          for _ in $(seq 1 60); do
+            if curl -sf "https://index.crates.io/st/at/state_macros" \
+              | jq -e --arg v "$version" 'select(.vers == $v)' >/dev/null 2>&1; then
+              rm -rf ~/.cargo/registry/index/*/.cache
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::state_macros $version did not appear on the index within 10 minutes"
+          exit 1
+
+      - name: Publish agsim
+        if: steps.published.outputs.agsim == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MACROS_ON_INDEX: ${{ steps.published.outputs.state_macros }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            if [ "$MACROS_ON_INDEX" = "false" ]; then
+              echo "::notice::skipping agsim dry run: state_macros ${{ steps.versions.outputs.state_macros }} is not on crates.io yet, so the verification build cannot resolve it"
+              exit 0
+            fi
+            cargo publish -p agsim --locked --dry-run
+          else
+            cargo publish -p agsim --locked
+          fi
+
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "agsim ${{ steps.versions.outputs.agsim }}" \
+            --generate-notes
