@@ -1,5 +1,6 @@
 # agsim
 
+[![CI](https://github.com/jamieyoung5/agsim/actions/workflows/ci.yml/badge.svg)](https://github.com/jamieyoung5/agsim/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/agsim.svg)](https://crates.io/crates/agsim)
 [![docs.rs](https://docs.rs/agsim/badge.svg)](https://docs.rs/agsim)
 [![license](https://img.shields.io/crates/l/agsim.svg)](LICENSE)
